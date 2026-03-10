@@ -92,8 +92,8 @@ These are the safest near-term actions for diagnosing or improving slow Ampere i
 Use the existing perf script so you can see whether the slowdown is in prompt ingestion, token generation, or both:
 
 ```sh
-cd /home/runner/work/exllamav3_ampere/exllamav3_ampere
-python eval/perf.py -m /path/to/model-exl3 -chunk_size 4096 -max_length 8192
+cd /path/to/exllamav3
+python eval/perf.py -m /path/to/model-exl3 --chunk_size 4096 --max_length 8192
 ```
 
 If prefill is much slower than decode, the issue is probably in chunked attention/prefill behavior or large GEMMs. If decode collapses first, small-shape GEMM/GEMV efficiency is the better target.
@@ -103,20 +103,20 @@ If prefill is much slower than decode, the issue is probably in chunked attentio
 `eval/perf.py` exposes `--chunk_size`, and Ampere may want a different tradeoff from Ada:
 
 ```sh
-cd /home/runner/work/exllamav3_ampere/exllamav3_ampere
-python eval/perf.py -m /path/to/model-exl3 -chunk_size 2048 -max_length 8192
-python eval/perf.py -m /path/to/model-exl3 -chunk_size 4096 -max_length 8192
-python eval/perf.py -m /path/to/model-exl3 -chunk_size 8192 -max_length 8192
+cd /path/to/exllamav3
+python eval/perf.py -m /path/to/model-exl3 --chunk_size 2048 --max_length 8192
+python eval/perf.py -m /path/to/model-exl3 --chunk_size 4096 --max_length 8192
+python eval/perf.py -m /path/to/model-exl3 --chunk_size 8192 --max_length 8192
 ```
 
 This changes runtime scheduling, not model quality.
 
 ### Rebuild for the Ampere target you actually use
 
-When building from source, it is reasonable to target Ampere explicitly so the extension is compiled for the hardware you care about:
+When building from source, it is reasonable to target Ampere explicitly so the extension is compiled for the hardware you care about. For example, `8.0;8.6` covers common A100 and RTX 30-series targets; add other SM versions if your Ampere deployment needs them:
 
 ```sh
-cd /home/runner/work/exllamav3_ampere/exllamav3_ampere
+cd /path/to/exllamav3
 export TORCH_CUDA_ARCH_LIST="8.0;8.6"
 pip install .
 ```
@@ -128,7 +128,7 @@ This does not change model outputs. It only changes how the CUDA extension is co
 The repository already contains a focused QGEMM benchmarking script:
 
 ```sh
-cd /home/runner/work/exllamav3_ampere/exllamav3_ampere
+cd /path/to/exllamav3
 python science/qgemm_benchmark.py
 ```
 
@@ -139,7 +139,7 @@ Before using it on a single Ampere GPU, set the `devices` list in the script to 
 If part of the complaint is "Ampere is slow" during conversion rather than runtime inference, use the existing multi-GPU switches first:
 
 ```sh
-cd /home/runner/work/exllamav3_ampere/exllamav3_ampere
+cd /path/to/exllamav3
 python convert.py -i /path/to/model \
                   -o /path/to/model-exl3 \
                   -w /path/to/workdir \
