@@ -121,9 +121,12 @@ class SMConsumer:
         device: int | None = None,
         pin_memory: bool = False,
     ):
-        self.pin_memory = pin_memory
+        # CPU-reduce process (device == -1) must not touch the CUDA runtime; skip
+        # pinning and device selection for it.
+        self.pin_memory = pin_memory and (device is None or device >= 0)
         self.device = device
-        torch.cuda.set_device(self.device)
+        if self.device is not None and self.device >= 0:
+            torch.cuda.set_device(self.device)
 
         def get_local_tensor(shm_buf, _buffer_size):
             # Create local uint8 tensor mapping the entire shared buffer
@@ -144,7 +147,7 @@ class SMConsumer:
             self.arena = get_local_tensor(self.shm.buf, self.buffer_size)
 
             # Optionally pin memory
-            if pin_memory:
+            if self.pin_memory:
                 torch.cuda.set_device(self.device)
                 cuda_host_register(self.arena.data_ptr(), self.arena.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
 
@@ -158,7 +161,7 @@ class SMConsumer:
             self.arena = get_local_tensor(self.shm.buf, self.buffer_size)
 
             # Optionally pin memory
-            if pin_memory:
+            if self.pin_memory:
                 torch.cuda.set_device(self.device)
                 assert not self.producer.buf_is_pinned, "Only one local consumer can pin arena"
                 cuda_host_register(self.arena.data_ptr(), self.arena.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
@@ -234,5 +237,5 @@ class SMConsumer:
     def close(self):
         if self.pin_memory:
             cuda_host_unregister(self.arena.data_ptr())
-        if self.producer is not None:
+        if self.producer is None:
             self.shm.close()

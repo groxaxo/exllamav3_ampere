@@ -214,9 +214,25 @@ void exl3_gemm_kernel_inner
                 #pragma unroll
                 for (int i = 0; i < load_a_iters; ++i)
                 {
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860)
+                    if (pred_a_gl[i])
+                    {
+                        int linear_idx = t + i * EXL3_GEMM_BASE_THREADS;
+                        int smem_row = linear_idx / (TILESIZE_K / 8);
+                        int smem_col = linear_idx % (TILESIZE_K / 8);
+                        int swizzled_col = smem_col ^ (smem_row % (TILESIZE_K / 8));
+                        int smem_idx = smem_row * (TILESIZE_K / 8) + swizzled_col;
+                        uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(sh + smem_idx));
+                        asm volatile(
+                            "cp.async.cg.shared.global [%0], [%1], 16;\n"
+                            :: "r"(smem_addr), "l"(gl + load_a_gl[i]) : "memory"
+                        );
+                    }
+                    #else
                     // TODO: Rearrange into ldmatrix friendly layout while loading?
                     // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_a_gl[i], pred_a_gl[i]);
                     if (pred_a_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_a_gl[i]);
+                    #endif
                 }
             }
 
@@ -247,6 +263,19 @@ void exl3_gemm_kernel_inner
 
         // A fragments
         {
+            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860)
+            int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
+            int c = lane_id / 16;
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+            {
+                int base_row = r + m * 16;
+                int base_col = c + sub_k * 16 / 8;
+                int swizzled_col = base_col ^ (base_row % (TILESIZE_K / 8));
+                int4* sha = (int4*) sh1_a_ptr + base_row * (TILESIZE_K / 8) + swizzled_col;
+                ldsm4(frag_a[buf][m], sha);
+            }
+            #else
             // TODO: Resolve bank conflicts
             int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
             int c = lane_id / 16;
@@ -254,6 +283,7 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
                 ldsm4(frag_a[buf][m], sha + (m * 16) * TILESIZE_K / 8 + sub_k * 16 / 8);
+            #endif
         }
 
         // B fragments

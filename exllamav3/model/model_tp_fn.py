@@ -22,7 +22,8 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
         "output_device": output_device,
     }
 
-    torch.cuda.set_device(device)
+    if device >= 0:
+        torch.cuda.set_device(device)
 
     match backend_args["type"]:
         case "nccl":
@@ -72,7 +73,8 @@ def mp_model_worker(
             msg = conn.recv()
             if msg == "quit":
                 log_tp(device, f"Child worker exiting")
-                torch.cuda.synchronize()
+                if device >= 0:
+                    torch.cuda.synchronize()
                 local_context["inf_consumer"].close()
                 local_context["backend"].close()
                 break

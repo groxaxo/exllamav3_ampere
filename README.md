@@ -15,6 +15,18 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
+## Ampere benchmark snapshot
+
+These measurements were taken on this fork with `eval/perf.py` in the `exl3-dev` conda environment, using
+`Llama-3.1-8B-Instruct-exl3-4.0bpw` on Ampere `sm_86` GPUs and comparing the current Ampere-tuned worktree against a
+clean baseline worktree from the same code snapshot. Greedy output tokens matched exactly in both the single-GPU and
+2-GPU checks.
+
+| Setup | Prefill avg. vs baseline | Decode avg. vs baseline | Notes |
+| --- | ---: | ---: | --- |
+| 1x RTX 3090 | `+0.99%` | `+1.22%` | Same greedy tokens as baseline |
+| 2x RTX 3090, native TP | `+0.30%` | `+11.56%` | `+17.14%` decode at contexts `>= 1024`, same greedy tokens as baseline |
+
 ### ⚠️ Important
 
 - **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires

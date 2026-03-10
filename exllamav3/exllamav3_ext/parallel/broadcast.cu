@@ -192,7 +192,7 @@ void pg_broadcast_ll_kernel
     // least once before the next broadcast. Only load in thread 0 to reduce PCIe traffic.
     __shared__ uint32_t cookie_s;
     if (threadIdx.x == 0)
-        cookie_s = ldg_cv_u32(&ctx->barrier_epoch);
+        cookie_s = ldg_acquire_sys_u32(&ctx->barrier_epoch);
     __syncthreads();
     uint32_t cookie = cookie_s;
 
