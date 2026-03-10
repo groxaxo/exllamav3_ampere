@@ -27,11 +27,16 @@ clean baseline worktree from the same code snapshot. Greedy output tokens matche
 | 1x RTX 3090 | `+0.99%` | `+1.22%` | Same greedy tokens as baseline |
 | 2x RTX 3090, native TP | `+0.30%` | `+11.56%` | `+17.14%` decode at contexts `>= 1024`, same greedy tokens as baseline |
 
+For a separate RTX 3060-focused Qwen3.5 experiment covering Flash Linear Attention, `causal-conv1d`, and the
+optional recurrent-backend switch, see [Qwen3.5 FLA / Ampere notes](doc/qwen35_fla_ampere.md).
+
 ### ⚠️ Important
 
 - **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires
   Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
   supported and recommended but not required.
+- The Qwen3.5 linear-attention path also supports `EXLLAMA_GDN_RECURRENT_BACKEND=auto|ext|fla` for experiments with
+  the recurrent backend. `auto` is the default and targets decode-heavy usage; see [Qwen3.5 FLA / Ampere notes](doc/qwen35_fla_ampere.md).
 - **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
 
 ## Architecture support

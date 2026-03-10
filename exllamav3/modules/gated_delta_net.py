@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -15,6 +16,12 @@ from ..util import profile_opt
 """
 causal_conv1d wrappers and fallback functions 
 """
+
+_gdn_recurrent_backend = os.environ.get("EXLLAMA_GDN_RECURRENT_BACKEND", "auto").lower()
+if _gdn_recurrent_backend not in {"auto", "ext", "fla"}:
+    raise ValueError(
+        "EXLLAMA_GDN_RECURRENT_BACKEND must be one of: auto, ext, fla"
+    )
 
 def causal_conv1d_update_function_torch(
     x,
@@ -81,8 +88,10 @@ except ModuleNotFoundError:
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-except ModuleNotFoundError:
+    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
+except (ModuleNotFoundError, ImportError, ValueError):
     chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule_fwd = None
 
 """
 fla wrapper, reduce overhead by bypassing input_guard and torch custom ops stuff
@@ -98,14 +107,22 @@ def fused_recurrent_gated_delta_rule(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ):
-    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
+    if fused_recurrent_gated_delta_rule_fwd is None:
+        raise ModuleNotFoundError(
+            "flash-linear-attention is required for fused recurrent gated delta rule"
+        )
 
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
     scale = k.shape[-1] ** -0.5
     with torch.cuda.device(q.device.index):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q,
             k,
-            v.contiguous(),
+            v,
             g,
             None,
             None,
@@ -117,6 +134,18 @@ def fused_recurrent_gated_delta_rule(
             None,
         )
     return o, final_state
+
+
+def should_use_fla_recurrent(seqlen: int):
+    if _gdn_recurrent_backend == "ext":
+        return False
+    if _gdn_recurrent_backend == "fla":
+        if fused_recurrent_gated_delta_rule_fwd is None:
+            raise ModuleNotFoundError(
+                "EXLLAMA_GDN_RECURRENT_BACKEND=fla requires flash-linear-attention"
+            )
+        return True
+    return seqlen == 1 and fused_recurrent_gated_delta_rule_fwd is not None
 
 
 def torch_recurrent_gated_delta_rule(
@@ -694,17 +723,38 @@ class GatedDeltaNet(Module):
                         dtype = torch.float,
                         device = self.device
                     )
-                ext.cuda_recurrent_gated_delta_rule(
-                    mixed_qkv,
-                    g,
-                    beta,
-                    recurrent_state,
-                    core_attn_out,
-                    self.num_k_heads,
-                    self.num_v_heads,
-                    self.k_head_dim,
-                    self.v_head_dim
-                )
+                if should_use_fla_recurrent(seqlen):
+                    q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
+                    q = q.view(bsz, seqlen, self.num_k_heads, self.k_head_dim)
+                    k = k.view(bsz, seqlen, self.num_k_heads, self.k_head_dim)
+                    v = v.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+
+                    if self.num_v_groups > 1:
+                        q = q.repeat_interleave(self.num_v_groups, dim = 2)
+                        k = k.repeat_interleave(self.num_v_groups, dim = 2)
+
+                    core_attn_out, recurrent_state = fused_recurrent_gated_delta_rule(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        initial_state = recurrent_state,
+                        output_final_state = save_state,
+                        use_qk_l2norm_in_kernel = True,
+                    )
+                else:
+                    ext.cuda_recurrent_gated_delta_rule(
+                        mixed_qkv,
+                        g,
+                        beta,
+                        recurrent_state,
+                        core_attn_out,
+                        self.num_k_heads,
+                        self.num_v_heads,
+                        self.k_head_dim,
+                        self.v_head_dim
+                    )
 
             # Norm
             core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
