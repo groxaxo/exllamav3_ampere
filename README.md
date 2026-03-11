@@ -1,45 +1,50 @@
+# ExLlamaV3 Ampere Inference Notes
 
-# <img src="doc/cat.png" width="40"> ExLlamaV3
+This repo is a custom `exllamav3` fork with a small set of local OpenAI-compatible inference scripts for Ampere GPUs.
 
-ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
+The current setup keeps the scripts created on `2026-03-11` as the base set and folds the `Qwen3.5-27B` mixed-GPU work into that set instead of keeping a separate one-off script from `2026-03-12`.
 
-- New [EXL3](doc/exl3.md) quantization format based on QTIP
-- Flexible tensor-parallel and expert-parallel inference for consumer hardware setups
-- OpenAI-compatible server provided via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) 
-- Continuous, dynamic batching
-- HF Transformers plugin (see [here](examples/transformers_integration.py))
-- HF model support (see [supported architectures](#architecture-support))
-- Speculative decoding
-- 2-8 bit cache quantization
-- Multimodal support
+## Included inference scripts
 
-The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
+### `server_openai.py`
+- Single `RTX 3060`
+- Model path: `models/Qwen3.5-9B-exl3`
+- Port: `8001`
+- Intended for lower-VRAM single-GPU testing
 
-## Ampere benchmark snapshot
+### `server_3090.py`
+- Single `RTX 3090`
+- Model path: `models/Qwen3.5-9B-exl3`
+- Port: `8002`
+- Intended for higher-context single-GPU testing
 
-These measurements were taken on this fork with `eval/perf.py` in the `exl3-dev` conda environment, using
-`Llama-3.1-8B-Instruct-exl3-4.0bpw` on Ampere `sm_86` GPUs and comparing the current Ampere-tuned worktree against a
-clean baseline worktree from the same code snapshot. Greedy output tokens matched exactly in both the single-GPU and
-2-GPU checks.
+### `server_dual_gpu.py`
+- Dual `RTX 3090`
+- Model path: `models/Qwen3.5-9B-exl3`
+- Port: `8002`
+- Uses layer-split loading across two 3090s
 
-| Setup | Prefill avg. vs baseline | Decode avg. vs baseline | Notes |
-| --- | ---: | ---: | --- |
-| 1x RTX 3090 | `+0.99%` | `+1.22%` | Same greedy tokens as baseline |
-| 2x RTX 3090, native TP | `+0.30%` | `+11.56%` | `+17.14%` decode at contexts `>= 1024`, same greedy tokens as baseline |
+### `server_mixed.py`
+- Mixed `RTX 3090 + RTX 3060`
+- Model path: `models/Qwen3.5-27B-exl3`
+- Port: `8003`
+- Uses quantized KV cache (`4-bit K/V`)
+- Configured for about `150k` context via `CACHE_TOKENS = 150016`
+- This is the script to use for the current `Qwen3.5-27B` mixed-GPU inference setup
 
-For a separate RTX 3060-focused Qwen3.5 experiment covering Flash Linear Attention, `causal-conv1d`, and the
-optional recurrent-backend switch, see [Qwen3.5 FLA / Ampere notes](doc/qwen35_fla_ampere.md).
+### `server_32k.py`
+- Mixed `RTX 3090 + RTX 3060`
+- Model path: `models/Qwen3.5-9B-exl3`
+- Port: `8004`
+- Fixed `32k` context variant for the 9B setup
 
-### ⚠️ Important
+## What changed
 
-- **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires
-  Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
-  supported and recommended but not required.
-- The Qwen3.5 linear-attention path also supports `EXLLAMA_GDN_RECURRENT_BACKEND=auto|ext|fla` for experiments with
-  the recurrent backend. `auto` is the default and targets decode-heavy usage; see [Qwen3.5 FLA / Ampere notes](doc/qwen35_fla_ampere.md).
-- **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
+- Removed `server_qwen27b_150k_mixed.py`
+- Moved its useful configuration into `server_mixed.py`
+- Replaced the downloaded model-card-style top-level README with repo-specific documentation
 
-## Architecture support
+## Environment
 
 - **AFM** (ArceeForCausalLM)
 - **Apertus** (ApertursForCausalLM)
@@ -76,147 +81,77 @@ optional recurrent-backend switch, see [Qwen3.5 FLA / Ampere notes](doc/qwen35_f
 - **SolarOpen** (SolarOpenForCausalLM)
 - **Step 3.5 Flash** (Step3p5ForCausalLM)
 
-Always adding more, stay tuned.
+- Conda env: `exl3-dev`
+- Torch libraries at `/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages/torch/lib`
+- Models under `/home/op/exllamav3_ampere/models/`
 
+Activate the environment before starting a server:
 
-## What's missing?
-
-Currently on the to-do list:
-
-- Lots of optimization
-- LoRA support
-- ROCm support
-- More sampling functions
-- More quantization modes (FP4 etc.)
-
-As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
-
-
-## How to?
-
-[TabbyAPI](https://github.com/theroyallab/tabbyAPI/) has a startup script that manages and installs prerequisites if you want to get started quickly with inference in an OAI-compatible client. 
-
-Otherwise, start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
-
-### Method 1: Installing from prebuilt wheel (recommended if you're unsure)
-
-Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3/releases), then e.g.:
-
-```sh
-pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
+```bash
+conda activate exl3-dev
+export LD_LIBRARY_PATH=/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH
 ```
 
-### Method 2: Installing from PyPi:
+## Launch commands
 
-```sh
-pip install exllamav3
-```
-Note that the PyPi package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).    
+### Single 3060
 
-### Method 3: Building from source
-
-```sh
-# Clone the repo
-git clone https://github.com/turboderp-org/exllamav3
-cd exllamav3
-
-# (Optional) switch to dev branch for latest in-progress features
-git checkout dev
-
-# Install requirements (make sure you install Torch separately)
-pip install -r requirements.txt
+```bash
+CUDA_VISIBLE_DEVICES=2 python server_openai.py
 ```
 
-At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
+### Single 3090
 
-To install the library for the active venv, run from the repo directory:
-
-```sh
-pip install .
+```bash
+CUDA_VISIBLE_DEVICES=0 python server_3090.py
 ```
 
-Relevant env variables for building:
-- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
-- `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
+### Dual 3090
 
-
-## Conversion
-
-To convert a model to EXL3 format, use:
-
-```sh
-# Convert model
-python convert.py -i <input_dir> -o <output_dir> -w <working_dir> -b <bitrate>
-
-# Resume an interrupted quant job
-python convert.py -w <working_dir> -r
-
-# More options
-python convert.py -h
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python server_dual_gpu.py
 ```
 
-The working directory is temporary storage for state checkpoints and for storing quantized tensors until the converted model can be compiled. It should have enough free space to store an entire copy of the output model. Note that while EXL2 conversion by default resumes an interrupted job when pointed to an existing folder, EXL3 needs you to explicitly resume with the `-r`/`--resume` argument.    
+### Mixed 3090 + 3060 for Qwen3.5-27B
 
-See [here](doc/convert.md) for more information.
-
-
-## Examples
-
-A number of example scripts are provided to showcase the features of the backend and generator. Some of them have hardcoded model paths and should be edited before you run them, but there is a simple CLI chatbot that you can start with:
-
-```sh
-python examples/chat.py -m <input_dir> -mode <prompt_mode> 
-
-# E.g.:
-python examples/chat.py -m /mnt/models/llama3.1-8b-instruct-exl3 -mode llama3
-
-# Wealth of options
-python examples/chat.py -h
+```bash
+CUDA_VISIBLE_DEVICES=0,2 python server_mixed.py
 ```
 
-## EXL3 quantization
+### Mixed 3090 + 3060 at 32K for Qwen3.5-9B
 
-<div align="center">
-    <a href="doc/exl3.md" target="_blank">
-        <img src="doc/llama31_8b_instruct_bpw.png" width="640">
-    </a>
-</div>
+```bash
+CUDA_VISIBLE_DEVICES=1,3 python server_32k.py
+```
 
-Despite their amazing achievements, most SOTA quantization techniques remain cumbersome or even prohibitively expensive to use. For instance, **AQLM** quantization of a 70B model takes around **720 GPU-hours** on an A100 server, costing $850 US at the time of writing. ExLlamaV3 aims to address this with the **EXL3** format, which is a streamlined variant of [**QTIP**](https://github.com/Cornell-RelaxML/qtip) from Cornell RelaxML. The conversion process is designed to be simple and efficient and requires only an input model (in HF format) and a target bitrate. By computing Hessians on the fly and thanks to a fused Viterbi kernel, the quantizer can convert a model in a single step, taking a couple of minutes for smaller models, up to a few hours for larger ones (70B+) (on a single RTX 4090 or equivalent GPU.)
+## API checks
 
-The [Marlin](https://github.com/IST-DASLab/marlin)-inspired GEMM kernel achieves roughly memory-bound latency under optimal conditions (4bpw, RTX 4090), though it still needs some work to achieve the same efficiency on Ampere GPUs and to remain memory-bound at lower bitrates. See [Ampere optimization notes](doc/ampere_optimization.md) for a focused analysis, profiling checklist and optimization todo list.
+Health:
 
-Since converted models largely retain the original file structure (unlike **EXL2** which renames some tensors in its quest to turn every model into a Llama variant), it will be possible to extend **EXL3** support to other frameworks like HF Transformers and vLLM.
+```bash
+curl http://localhost:8003/health
+```
 
-There are some benchmark results [here](doc/exl3.md), and a full writeup on the format is coming soon.
+List models:
 
-Fun fact: Llama-3.1-70B-EXL3 is coherent at 1.6 bpw. With the output layer quantized to 3 bpw and a 4096-token cache, inference is possible in under 16 GB of VRAM. 
+```bash
+curl http://localhost:8003/v1/models
+```
 
+Chat completion:
 
-### Community
+```bash
+curl http://localhost:8003/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-27B-exl3",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 128
+  }'
+```
 
-You are always welcome to join the [ExLlama discord server](https://discord.gg/NSFwVuCjRq) ←🎮  
+## Notes
 
-
-### 🤗 HuggingFace repos
-
-A selection of EXL3-quantized models is available [here](https://huggingface.co/collections/turboderp/exl3-models-67f2dfe530f05cb9f596d21a). Also shout out the following lovely people:
- 
-- [ArtusDev](https://huggingface.co/ArtusDev)
-- [MikeRoz](https://huggingface.co/MikeRoz) 
-- [MetaphoricalCode](https://huggingface.co/MetaphoricalCode) 
-- [Ready.Art](https://huggingface.co/ReadyArt) 
-- [isogen](https://huggingface.co/isogen/models)
-
-
-## Acknowledgements
-
-This project owes its existence to a wonderful community of FOSS developers and some very generous supporters (🐈❤️!) The following projects in particular deserve a special mention:
-
-- [TabbyAPI](https://github.com/theroyallab/tabbyAPI/)
-- [PyTorch](https://github.com/pytorch/pytorch)
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-- [QTIP](https://github.com/Cornell-RelaxML/qtip)
-- [Transformers](https://github.com/huggingface/transformers)
-- [Marlin](https://github.com/IST-DASLab/marlin)
-- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
+- `server_mixed.py` is now the main mixed-GPU script for the 27B model.
+- The older 9B scripts are kept because they are still useful for comparison and lighter-weight testing.
+- Files such as logs, downloaded model blobs, cache directories, and local benchmark output are intentionally not documented as committed project artifacts.
