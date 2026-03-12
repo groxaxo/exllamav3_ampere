@@ -188,6 +188,7 @@ class BlockSparseMLP(Module):
         routing_last: int | None = None,
         routing_device: int | None = None,
         transposed_load: bool = True,
+        transpose_fused_weights: bool = True,
     ):
         super().__init__(config, key, None)
 
@@ -285,6 +286,7 @@ class BlockSparseMLP(Module):
                     qmap = qmap + ".input",
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
+                    transpose_fused_weights = transpose_fused_weights,
                 )
                 up = Linear(
                     config = config,
@@ -297,6 +299,7 @@ class BlockSparseMLP(Module):
                     qmap = qmap + ".input",
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
+                    transpose_fused_weights = transpose_fused_weights,
                 )
                 down = Linear(
                     config = config,
@@ -309,6 +312,7 @@ class BlockSparseMLP(Module):
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
                     transposed_load = transposed_load,
+                    transpose_fused_weights = transpose_fused_weights,
                 )
 
                 self.ups.append(up)
@@ -615,12 +619,12 @@ class BlockSparseMLP(Module):
 
                 # Group once by local expert id (including sentinel for expert-P mode)
                 order = flat_expert_local.argsort()
-                local_sorted = flat_expert_local[order]
+                # local_sorted = flat_expert_local[order]
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
                 # Count how many assignments per expert
-                expert_count = torch.bincount(local_sorted, minlength = E + 1)
+                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 expert_ptr = torch.empty(E + 2, device = y.device, dtype = torch.long)
                 expert_ptr[0] = 0
                 expert_ptr[1:] = expert_count.cumsum(0)
