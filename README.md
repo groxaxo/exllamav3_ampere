@@ -155,3 +155,7 @@ curl http://localhost:8003/v1/chat/completions \
 - `server_mixed.py` is now the main mixed-GPU script for the 27B model.
 - The older 9B scripts are kept because they are still useful for comparison and lighter-weight testing.
 - Files such as logs, downloaded model blobs, cache directories, and local benchmark output are intentionally not documented as committed project artifacts.
+
+## Related docs
+
+- `doc/quantizer_ampere_findings.md`: quantizer analysis, Ampere-specific copy-based changes, and RTX 3060 validation notes.

@@ -10,24 +10,38 @@ if os.path.exists(torch_lib):
     )
 
 import json
+import logging
 import time
+import traceback
 import uuid
 import torch
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Optional, List
 import uvicorn
 
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
 from exllamav3.cache import CacheLayer_quant
 
-MODEL_DIR = "/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3"
-PORT = 8003
-CACHE_TOKENS = 150016
-GPU_SPLIT = [22.0, 10.5]
+MODEL_DIR = os.getenv("MODEL_DIR", "/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3")
+MODEL_ID = os.getenv("MODEL_ID", os.path.basename(MODEL_DIR.rstrip("/")))
+PORT = int(os.getenv("PORT", "8003"))
+CACHE_TOKENS = int(os.getenv("CACHE_TOKENS", "150016"))
+GPU_SPLIT = [float(x) for x in os.getenv("GPU_SPLIT", "22.0,10.5").split(",")]
+DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "16000"))
+MIN_MAX_TOKENS = int(os.getenv("MIN_MAX_TOKENS", "12"))
+MAX_MAX_TOKENS = int(os.getenv("MAX_MAX_TOKENS", "16000"))
+ENABLE_THINKING = os.getenv("ENABLE_THINKING", "false").lower() == "true"
 
-app = FastAPI(title="ExLlamaV3 OpenAI Server - Qwen3.5-27B Mixed 150K")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("server_mixed")
+
+app = FastAPI(title=f"ExLlamaV3 OpenAI Server - {MODEL_ID} Mixed")
 
 model = None
 config = None
@@ -44,7 +58,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    max_tokens: Optional[int] = 512
+    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
     stream: Optional[bool] = False
@@ -66,14 +80,14 @@ def format_chatml(messages: List[ChatMessage], add_assistant: bool = True):
 
 def test_max_context():
     global model, config, cache, tokenizer
+    assert model is not None
 
-    print("\n=== Testing Maximum Context Length ===")
+    logger.info("=== Testing Maximum Context Length ===")
 
-    # With CUDA_VISIBLE_DEVICES=0,2, the logical GPUs are 0 and 1
     for gpu_id in [0, 1]:
         torch.cuda.set_device(gpu_id)
         free_mem = torch.cuda.mem_get_info()[0] / (1024**3)
-        print(f"Logical GPU {gpu_id} free memory: {free_mem:.2f} GB")
+        logger.info(f"Logical GPU {gpu_id} free memory: {free_mem:.2f} GB")
 
     test_sizes = [65536, 98304, 131072, CACHE_TOKENS]
 
@@ -89,9 +103,9 @@ def test_max_context():
             test_cache.detach_from_model(model)
             del test_cache
             torch.cuda.empty_cache()
-            print(f"  {size} tokens: OK")
+            logger.info(f"  {size} tokens: OK")
         except Exception as e:
-            print(f"  {size} tokens: FAILED - {e}")
+            logger.exception(f"  {size} tokens: FAILED - {e}")
             break
 
 
@@ -99,7 +113,8 @@ def test_max_context():
 async def load_model():
     global model, config, cache, tokenizer, generator
 
-    print("Loading model on GPU 0 (RTX 3090) + GPU 2 (RTX 3060)...")
+    logger.info(f"Loading model from {MODEL_DIR}...")
+    logger.info(f"Using split {GPU_SPLIT} across visible GPUs")
 
     config = Config.from_directory(MODEL_DIR)
     model = Model.from_config(config)
@@ -117,25 +132,104 @@ async def load_model():
 
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
 
-    print("Model loaded!")
+    logger.info("Model loaded!")
     test_max_context()
+
+
+def _log_request_start(
+    request_id: str, request: ChatCompletionRequest, prompt_tokens: int
+):
+    logger.info(
+        "request_id=%s stream=%s prompt_tokens=%s max_tokens=%s temperature=%s top_p=%s messages=%s",
+        request_id,
+        request.stream,
+        prompt_tokens,
+        request.max_tokens,
+        request.temperature,
+        request.top_p,
+        len(request.messages),
+    )
+
+
+def _log_request_end(
+    request_id: str, finish_reason: str, prompt_tokens: int, completion_tokens: int
+):
+    logger.info(
+        "request_id=%s finish_reason=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+        request_id,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+        prompt_tokens + completion_tokens,
+    )
+
+
+def _get_input_ids(encoded: Any):
+    if isinstance(encoded, tuple):
+        return encoded[0]
+    return encoded
+
+
+def _normalize_max_tokens(requested: Optional[int]) -> int:
+    if requested is None or requested <= 0:
+        return DEFAULT_MAX_TOKENS
+    return min(requested, MAX_MAX_TOKENS)
+
+
+def _strip_thinking(text: str) -> str:
+    while True:
+        start = text.find("<think>")
+        if start == -1:
+            break
+        end = text.find("</think>", start)
+        if end == -1:
+            text = text[:start].strip()
+            break
+        text = (text[:start] + text[end + len("</think>") :]).strip()
+    return text
+
+
+def _encode_messages(messages: List[ChatMessage]):
+    assert tokenizer is not None
+    hf_messages = [{"role": m.role, "content": m.content} for m in messages]
+    try:
+        return tokenizer.hf_chat_template(
+            hf_messages,
+            add_generation_prompt=True,
+            enable_thinking=ENABLE_THINKING,
+        )
+    except Exception:
+        logger.warning(
+            "hf_chat_template_failed_falling_back_to_manual\n%s", traceback.format_exc()
+        )
+        prompt = format_chatml(messages)
+        return _get_input_ids(
+            tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
+        )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     global model, config, cache, tokenizer, generator
+    assert tokenizer is not None
+    assert generator is not None
+    gen: Any = generator
 
-    prompt = format_chatml(request.messages)
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
-    input_ids = tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
+    request.max_tokens = _normalize_max_tokens(request.max_tokens)
+
+    input_ids = _encode_messages(request.messages)
+    prompt_tokens = input_ids.shape[-1]
+    _log_request_start(request_id, request, prompt_tokens)
 
     stop_tokens = [tokenizer.eos_token_id, tokenizer.single_id("<|im_end|>")]
 
     from exllamav3.generator.sampler import ComboSampler
 
     sampler = ComboSampler(
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=request.temperature if request.temperature is not None else 0.7,
+        top_p=request.top_p if request.top_p is not None else 0.9,
         min_p=0.0,
         top_k=0,
     )
@@ -150,69 +244,105 @@ async def chat_completions(request: ChatCompletionRequest):
     if request.stream:
 
         async def generate_stream():
-            generator.enqueue(job)
-            while generator.num_remaining_jobs():
-                for r in generator.iterate():
-                    chunk = r.get("text", "")
-                    if chunk:
-                        data = {
-                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": request.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": chunk},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
+            completion_tokens = 0
+            finish_reason = "length"
+            try:
+                gen.enqueue(job)
+                while gen.num_remaining_jobs():
+                    for r in gen.iterate():
+                        chunk = r.get("text", "")
+                        if r.get("new_tokens") is not None:
+                            completion_tokens = r.get("new_tokens")
+                        if chunk:
+                            data = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": request.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
 
-                    if r.get("eos"):
-                        data = {
-                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": request.model,
-                            "choices": [
-                                {"index": 0, "delta": {}, "finish_reason": "stop"}
-                            ],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                        yield "data: [DONE]\n\n"
+                        if r.get("eos"):
+                            finish_reason = "stop"
+
+                data = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                    ],
+                }
+                _log_request_end(
+                    request_id, finish_reason, prompt_tokens, completion_tokens
+                )
+                yield f"data: {json.dumps(data)}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception:
+                logger.error(
+                    "request_id=%s stream_generation_failed\n%s",
+                    request_id,
+                    traceback.format_exc(),
+                )
+                raise
 
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
     else:
-        generator.enqueue(job)
-        response_text = ""
-        total_new_tokens = 0
-        while generator.num_remaining_jobs():
-            for r in generator.iterate():
-                response_text += r.get("text", "")
-                if r.get("new_tokens"):
-                    total_new_tokens = r.get("new_tokens")
+        try:
+            gen.enqueue(job)
+            response_text = ""
+            total_new_tokens = 0
+            finish_reason = "length"
+            while gen.num_remaining_jobs():
+                for r in gen.iterate():
+                    response_text += r.get("text", "")
+                    if r.get("new_tokens") is not None:
+                        total_new_tokens = r.get("new_tokens")
+                    if r.get("eos"):
+                        finish_reason = "stop"
 
-        return {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": response_text},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": input_ids.shape[-1],
-                "completion_tokens": total_new_tokens,
-                "total_tokens": input_ids.shape[-1] + total_new_tokens,
-            },
-        }
+            cleaned_response_text = _strip_thinking(response_text)
+            _log_request_end(request_id, finish_reason, prompt_tokens, total_new_tokens)
+            return {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": cleaned_response_text,
+                        },
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": total_new_tokens,
+                    "total_tokens": prompt_tokens + total_new_tokens,
+                },
+            }
+        except Exception:
+            logger.error(
+                "request_id=%s generation_failed\n%s",
+                request_id,
+                traceback.format_exc(),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Generation failed; see server log for traceback",
+            )
 
 
 @app.get("/v1/models")
@@ -221,7 +351,7 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": "Qwen3.5-27B-exl3",
+                "id": MODEL_ID,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "local",
@@ -236,4 +366,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, access_log=True)
