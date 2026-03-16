@@ -57,6 +57,7 @@ clean baseline worktree from the same code snapshot. Greedy output tokens matche
 - **Mixtral** (MixtralForCausalLM)
 - **NanoChat** (NanoChatForCausalLM)
 - **Olmo 3.1** (Olmo3ForCausalLM)
+- **Olmo-Hybrid** (OlmoHybridForCausalLM)
 - **Phi3**, **Phi4** (Phi3ForCausalLM)
 - **Qwen 2**, **Qwen 2.5**, **Qwen 2.5 VL** (Qwen2ForCausalLM, Qwen2_5_VLForConditionalGeneration) *- multimodal*
 - **Qwen 3** (Qwen3ForCausalLM, Qwen3MoeForCausalLM)
