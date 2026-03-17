@@ -83,13 +83,15 @@ class TPBackendNCCL:
             log_tp(self.device, f"NCCL close: skip CPU process")
             return
 
-        dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
         self.fallback.close()
         dist.destroy_process_group()
 
 
     def fwd_barrier(self):
-        dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
@@ -99,11 +101,14 @@ class TPBackendNCCL:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self.world_size <= 1:
+            return
         if tensor.dtype == torch.float32:
-            temp = tensor.to(torch.bfloat16)
+            # Use FP16 for reduction transport — natively fast on Ampere (SM 8.x).
+            # BF16 is emulated on SM 8.6 (RTX 3090/3080) and adds unnecessary overhead.
+            temp = tensor.to(torch.float16)
             dist.all_reduce(temp, async_op = False)
-            temp = temp.to(torch.float32)
-            tensor.copy_(temp)
+            tensor.copy_(temp.to(torch.float32))
         else:
             dist.all_reduce(tensor, async_op = False)
 
@@ -300,6 +305,8 @@ class TPBackendNative:
 
 
     def fwd_barrier(self):
+        if len(self.active_devices) <= 1:
+            return
         ext.pg_barrier(self.ptr_g, self.active_devices, self.device, self.abort_flag)
 
 
@@ -329,6 +336,8 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if len(self.active_devices) <= 1:
+            return
         # if tensor.numel() * 2 < MAX_CPU_REDUCE:
         ext.pg_all_reduce_cpu(
             self.ptr_g,
