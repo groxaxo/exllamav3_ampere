@@ -69,6 +69,7 @@ DEFAULT_TP_BACKEND = os.getenv("TP_BACKEND", "nccl")
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "16000"))
 MIN_MAX_TOKENS = int(os.getenv("MIN_MAX_TOKENS", "12"))
 MAX_MAX_TOKENS = int(os.getenv("MAX_MAX_TOKENS", "16000"))
+ENABLE_STARTUP_WARMUP = os.getenv("EXLLAMA_STARTUP_WARMUP", "1").lower() in ("1", "true", "yes")
 
 # ------------------------------------------------------------------
 # Globals (populated during startup)
@@ -173,8 +174,6 @@ def generate_with_generator(input_ids: torch.Tensor, request: ChatCompletionRequ
                     total_new_tokens = r.get("new_tokens")
                 if text or eos:
                     yield text, eos, total_new_tokens
-                if eos:
-                    return
 
 
 # ------------------------------------------------------------------
@@ -253,6 +252,33 @@ async def load_model():
         cache=cache,
         tokenizer=_tokenizer,
     )
+
+    if ENABLE_STARTUP_WARMUP:
+        print("Running startup warmup...")
+        warmup_prompt = (
+            "<|im_start|>user\nWhat is 2+2? Answer in one word only.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        warmup_ids = _tokenizer.encode(
+            warmup_prompt, add_bos=True, encode_special_tokens=True
+        )
+        if isinstance(warmup_ids, tuple):
+            warmup_ids = warmup_ids[0]
+        warmup_job = Job(
+            input_ids=warmup_ids,
+            max_new_tokens=8,
+            stop_conditions={
+                t
+                for t in [_tokenizer.eos_token_id, _tokenizer.single_id("<|im_end|>")]
+                if t is not None
+            },
+            sampler=ArgmaxSampler(),
+        )
+        t0 = time.time()
+        _generator.enqueue(warmup_job)
+        while _generator.num_remaining_jobs():
+            _generator.iterate()
+        print(f"  Warmup complete in {time.time() - t0:.3f}s")
 
     _gen_lock = asyncio.Lock()
     print(f"\nServer ready.  Cache = {_cache_tokens:,} tokens.\n")
