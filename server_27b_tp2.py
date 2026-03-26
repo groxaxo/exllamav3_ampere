@@ -30,14 +30,24 @@ import json
 import uuid
 
 # ------------------------------------------------------------------
-# Torch library path (required on this machine before importing torch)
+# CUDA / NCCL library paths — must be set before importing torch or
+# spawning worker processes.
+#
+# NCCL 2.28.9 requires libcudart.so.12 from CUDA 12.8.  The conda
+# environment has three candidates:
+#   nvidia/cuda_runtime/lib/libcudart.so.12  → CUDA 12.8  ✓
+#   ${conda_env}/lib/libcudart.so.12         → CUDA 12.1  ✗
+#   /lib/x86_64-linux-gnu/libcudart.so.12   → CUDA 12.0  ✗
+# Prepend the correct path so dlopen always finds CUDA 12.8.
 # ------------------------------------------------------------------
-torch_lib = "/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages/torch/lib"
-if os.path.exists(torch_lib):
-    os.environ.setdefault(
-        "LD_LIBRARY_PATH",
-        torch_lib + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
-    )
+_env_root = "/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages"
+_cuda_rt_lib = f"{_env_root}/nvidia/cuda_runtime/lib"
+_nccl_lib    = f"{_env_root}/nvidia/nccl/lib"
+_torch_lib   = f"{_env_root}/torch/lib"
+_prepend = ":".join(p for p in [_cuda_rt_lib, _nccl_lib, _torch_lib] if os.path.isdir(p))
+if _prepend:
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = _prepend + (":" + existing if existing else "")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

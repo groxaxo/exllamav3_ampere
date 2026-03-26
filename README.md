@@ -275,21 +275,37 @@ python /home/op/exllamav3_ampere/server_27b_layer.py \
 
 ### Qwen3.5-27B on dual RTX 3090s
 
-For the 27B model on physical GPUs `0,1`, the currently deployable launcher is
-`launch_27b_gpu01.sh`. On this machine, the NCCL TP2 path still fails with the
-CUDA driver/runtime mismatch recorded in the benchmark notes, so the launcher
-uses the stable layer-split server instead. It runs with:
+**TP2 (NCCL) is now the production path.** The previous NCCL failures were
+caused by `nvidia-nccl-cu13` (NCCL 2.28.9+cuda13.0) silently overwriting the
+correct `nvidia-nccl-cu12` (2.27.5, CUDA 12.8).  After fixing the package and
+the `LD_LIBRARY_PATH` order, NCCL initialises cleanly on GPUs 0,1.
 
-- `CUDA_VISIBLE_DEVICES=0,1`
-- `server_27b_layer.py`
-- `GPU_SPLIT=11.0,22.0`
-- `CACHE_TOKENS=131072` for a 128K default cache
-- `EXLLAMA_EMBED_PREFER_CPU=0` so embeddings stay on GPU
-- `MAX_THINKING_TOKENS=1024` to keep reasoning from consuming the full budget
+**Measured performance**: ~28.5 t/s sustained decode (vs ~25 t/s layer-split,
+**+14%**). Peak 29.5 t/s achieved in prior sessions.
 
-Raise `CACHE_TOKENS` only if you need more context and accept the extra memory
-and startup cost. If the NCCL/driver mismatch is resolved later, the TP2 path is
-still the faster benchmarked option to revisit.
+Launch with:
+
+```bash
+bash /home/op/exllamav3_ampere/launch_27b_gpu01.sh
+```
+
+The launcher now:
+- Uses `server_27b_tp2.py` (NCCL TP2)
+- `CUDA_VISIBLE_DEVICES=0,1`, `GPU_SPLIT=22.0,22.0`
+- `CACHE_TOKENS=131072` (128K context)
+- `NCCL_ALGO=TREE` for PCIe-connected 3090s
+- `LD_LIBRARY_PATH` with `nvidia/cuda_runtime/lib` **first** to ensure CUDA 12.8
+  `libcudart.so.12` is found before the conda env's older CUDA 12.1 copy
+- `MAX_THINKING_TOKENS=1024` to prevent overthinking
+
+If `nvidia-nccl-cu13` gets reinstalled in the future, NCCL will silently break
+again.  Check with:
+
+```bash
+conda run -n exl3-dev bash -c \
+  'strings $(python -c "import site; print(site.getsitepackages()[0])")/nvidia/nccl/lib/libnccl.so.2 | grep "NCCL version"'
+# Must show: NCCL version 2.27.5+cuda12.x  — NOT cuda13
+```
 
 ## Existing server scripts
 
@@ -324,15 +340,24 @@ discipline even when the backend is different. Reuse these ideas:
 
 ### TP2 fails during warmup or prefill
 
-- Fall back to layer-split first.
-- Do not keep retesting TP2 on the 3060 pair unless the CUDA driver/runtime
-  situation changed.
+Most likely culprit: `nvidia-nccl-cu13` is installed and has overwritten
+`libnccl.so.2` with an NCCL version built for CUDA 13 (requires driver ≥ 575).
+
+```bash
+# Diagnose
+pip show nvidia-nccl-cu12 nvidia-nccl-cu13
+strings /path/to/nvidia/nccl/lib/libnccl.so.2 | grep "NCCL version"
+# Fix
+pip uninstall nvidia-nccl-cu13 -y
+pip install "nvidia-nccl-cu12==2.27.5" --force-reinstall
+```
 
 ### NCCL backend fails at startup
 
-- Check for CUDA driver/runtime mismatch.
-- Use layer-split instead on this machine if the goal is to get a stable server
-  up quickly.
+1. Check which `libnccl.so.2` is being loaded (see above).
+2. Ensure `LD_LIBRARY_PATH` prepends `nvidia/cuda_runtime/lib` so CUDA 12.8
+   `libcudart.so.12` is resolved before older system or conda copies.
+3. As a last resort, fall back to layer-split with `server_27b_layer.py`.
 
 ### A module lands on CPU when it should not
 

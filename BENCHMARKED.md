@@ -830,3 +830,97 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1,4 NCCL_ALGO=TREE \
 - **Model**: Qwen3.5-27B-exl3 heretic 6bpw
 - **KV Cache**: FP16 (no quantization)
 - **Software**: ExLlamaV3 + flash_attn 2.7.4, Python 3.11, CUDA 12.x
+
+---
+
+## March 27, 2026 — TP2 NCCL Root-Cause Fix + Re-Validation
+
+### Problem: NCCL Silently Broken by Wrong Package
+
+After the March 18 work, the TP2 server stopped launching.  The error was:
+
+```
+NCCL error: ncclUnhandledCudaError: Cuda failure
+'CUDA driver version is insufficient for CUDA runtime version'
+NCCL version 2.28.9
+```
+
+This was previously misdiagnosed as a driver/libcudart path issue.  The real
+root cause was a **rogue pip package**:
+
+| Package | Version | Built for | Overwrites |
+|---------|---------|-----------|------------|
+| `nvidia-nccl-cu12` | 2.27.5 | CUDA 12.8 | `nvidia/nccl/lib/libnccl.so.2` |
+| `nvidia-nccl-cu13` | 2.28.9 | **CUDA 13.0** | same path — **wins** |
+
+`nvidia-nccl-cu13` was installed standalone (no dependents) and silently
+replaced the correct `libnccl.so.2`.  PyTorch 2.10.0+cu128 dynamically
+`dlopen`s `libnccl.so.2` at runtime, so it loaded NCCL 2.28.9+cuda13.0, which
+requires driver ≥ 575.51.02.  Our driver is 570.211.01 (max CUDA 12.8) →
+version check fails.
+
+**Secondary issue**: LD_LIBRARY_PATH in the launcher pointed to `torch/lib`
+first, but `torch/lib` ships **no** `libcudart.so.12` on this install.  The
+search fell back to:
+- `${conda_env}/lib/libcudart.so.12` → CUDA 12.1 ✗
+- `/lib/x86_64-linux-gnu/libcudart.so.12` → CUDA 12.0 ✗
+- `${site-packages}/nvidia/cuda_runtime/lib/libcudart.so.12` → CUDA 12.8 ✓
+
+### Fix Applied
+
+1. **Removed `nvidia-nccl-cu13`** and force-reinstalled `nvidia-nccl-cu12==2.27.5`.
+2. **Fixed `LD_LIBRARY_PATH` order** to prepend `nvidia/cuda_runtime/lib`
+   and `nvidia/nccl/lib` before `torch/lib`:
+
+```bash
+SP="/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages"
+export LD_LIBRARY_PATH="${SP}/nvidia/cuda_runtime/lib:${SP}/nvidia/nccl/lib:${SP}/torch/lib:${LD_LIBRARY_PATH:-}"
+```
+
+3. **Updated `server_27b_tp2.py`** to apply this path at the top of the script
+   (for `mp.spawn` workers to inherit it at exec time).
+4. **Updated `launch_27b_gpu01.sh`** with the corrected path.
+
+### Re-Validation Results (March 27, 2026)
+
+Environment: 2× RTX 3090, PCIe Gen3, driver 570.211.01, CUDA 12.8, NCCL 2.27.5
+
+| Test | Tokens | Time | t/s |
+|------|--------|------|-----|
+| Warmup token | 10 | 0.4 s | 23.3 |
+| No-thinking 300 tok | 71 | 2.5 s | 27.8 |
+| No-thinking 500 tok | 499 | 17.4 s | **28.7** |
+| Thinking+answer 500 tok | 511 | 18.0 s | **28.4** |
+| No-thinking 800 tok | 799 | 28.1 s | **28.4** |
+
+**Sustained decode: ~28.5 t/s** (vs ~25 t/s layer-split = **+14%**).
+
+Previously documented peak of 29.5 t/s remains achievable; the small delta is
+noise from PCIe communication and other GPU load (freed0m script on GPU 4
+during this run).
+
+### Updated Recommended Launch
+
+```bash
+# TP2 — default (128K context)
+cd /home/op/exllamav3_ampere
+bash launch_27b_gpu01.sh
+```
+
+The launch script now:
+- Uses `server_27b_tp2.py` (NCCL TP2) instead of layer-split
+- Sets correct LD_LIBRARY_PATH (cuda_runtime first)
+- Exports `NCCL_ALGO=TREE` for PCIe systems
+- Disables unnecessary per-forward barriers and gather fallbacks
+
+### Prevention
+
+To avoid future rogue `nvidia-nccl-cu13` installations:
+
+```bash
+# Check which NCCL is loaded
+pip show nvidia-nccl-cu12 nvidia-nccl-cu13
+# Verify the right binary
+strings /path/to/nvidia/nccl/lib/libnccl.so.2 | grep "NCCL version"
+# Must show: NCCL version 2.27.5+cuda12.x  (NOT cuda13)
+```

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # launch_27b_gpu01.sh
-# Optimized launch for Qwen3.5-27B-exl3 on GPUs 0,1 with layer-split
+# Optimized TP2 launch for Qwen3.5-27B-exl3 on GPUs 0,1 (RTX 3090 pair)
 
 set -eo pipefail
 
@@ -11,8 +11,8 @@ CONDA_ENV="${CONDA_ENV:-exl3-dev}"
 _BIND_HOST="${HOST:-0.0.0.0}"
 _BIND_PORT="${PORT:-1234}"
 MODEL_DIR="${MODEL_DIR:-/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3}"
-MODEL_ID="${MODEL_ID:-Qwen3.5-27B-exl3-3090-dual-layer}"
-GPU_SPLIT="${GPU_SPLIT:-11.0,22.0}"
+MODEL_ID="${MODEL_ID:-Qwen3.5-27B-exl3-3090-tp2}"
+GPU_SPLIT="${GPU_SPLIT:-22.0,22.0}"
 CACHE_TOKENS="${CACHE_TOKENS:-131072}"
 DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-16000}"
 MIN_MAX_TOKENS="${MIN_MAX_TOKENS:-12}"
@@ -22,6 +22,9 @@ PRESERVE_THINK_OUTPUT="${PRESERVE_THINK_OUTPUT:-true}"
 MAX_THINKING_TOKENS="${MAX_THINKING_TOKENS:-1024}"
 EXLLAMA_EMBED_PREFER_CPU="${EXLLAMA_EMBED_PREFER_CPU:-0}"
 EXLLAMA_STARTUP_WARMUP="${EXLLAMA_STARTUP_WARMUP:-1}"
+# NCCL tuning for PCIe-connected 3090s (no NVLink)
+NCCL_ALGO="${NCCL_ALGO:-TREE}"
+TP_BACKEND="${TP_BACKEND:-nccl}"
 
 LOG_DIR="${LOG_DIR:-/home/op/exllamav3_ampere/logs}"
 mkdir -p "$LOG_DIR"
@@ -43,12 +46,13 @@ fi
 touch "$LOGFILE"
 ln -sfn "$LOGFILE" "$CURRENT_LOG"
 
-printf 'Starting Qwen3.5-27B-exl3 on GPUs 0,1 (layer-split, optimized)\n'
+printf 'Starting Qwen3.5-27B-exl3 on GPUs 0,1 (TP2/NCCL, optimized)\n'
 printf '  Model dir   : %s\n' "$MODEL_DIR"
 printf '  Host:Port   : %s:%s\n' "$_BIND_HOST" "$_BIND_PORT"
 printf '  Model ID    : %s\n' "$MODEL_ID"
 printf '  GPU split   : %s\n' "$GPU_SPLIT"
 printf '  Cache tokens: %s\n' "$CACHE_TOKENS"
+printf '  TP backend  : %s (NCCL_ALGO=%s)\n' "$TP_BACKEND" "$NCCL_ALGO"
 printf '  Max tokens  : %s\n' "$DEFAULT_MAX_TOKENS"
 printf '  Thinking    : %s (preserve=%s, budget=%s)\n' "$ENABLE_THINKING" "$PRESERVE_THINK_OUTPUT" "$MAX_THINKING_TOKENS"
 printf '  Log file    : %s\n' "$LOGFILE"
@@ -61,7 +65,10 @@ conda activate "$CONDA_ENV"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="0,1"
 export PYTHONUNBUFFERED=1
-export LD_LIBRARY_PATH="/home/op/miniconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+# NCCL 2.28.9 requires CUDA 12.8 libcudart; prepend nvidia/cuda_runtime/lib before torch/lib
+_SP="/home/op/miniconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages"
+export LD_LIBRARY_PATH="${_SP}/nvidia/cuda_runtime/lib:${_SP}/nvidia/nccl/lib:${_SP}/torch/lib:${LD_LIBRARY_PATH:-}"
+unset _SP
 HOST="$_BIND_HOST"
 PORT="$_BIND_PORT"
 export MODEL_DIR
@@ -76,12 +83,14 @@ export PRESERVE_THINK_OUTPUT
 export MAX_THINKING_TOKENS
 export EXLLAMA_EMBED_PREFER_CPU
 export EXLLAMA_STARTUP_WARMUP
+export NCCL_ALGO
+export TP_BACKEND
 export PORT
 export HOST
 
 cd "$SCRIPT_DIR"
 
-nohup python server_27b_layer.py \
+nohup python server_27b_tp2.py \
     --host "$HOST" \
     --port "$PORT" \
     --model "$MODEL_DIR" \
