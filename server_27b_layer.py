@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible TP server for Qwen3.5-27B-exl3 (6bpw heretic variant).
+OpenAI-compatible layer-split server for Qwen3.5-27B-exl3 (6bpw heretic variant).
 
-Uses real tensor-parallel (NCCL) with fp16 KV cache and the Generator pipeline
-for cached, high-throughput generation.
+Uses layer-split (pipeline) mode across multiple GPUs — each GPU holds a subset of
+layers and activations pass sequentially. Avoids tensor-parallel cross-GPU comms,
+which fixes the GDN recurrent-state corruption seen with native/NCCL TP backends.
 
-Supports TP2, TP3, or any GPU count — set CUDA_VISIBLE_DEVICES accordingly.
+Works on RTX 3090 pairs (PCIe) and any multi-GPU setup where NCCL is unavailable.
 
 Usage:
-  # TP2 (2×RTX 3090)
+  # 2-GPU layer-split (2×RTX 3090)
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1 \\
-      python server_27b_tp2.py --gpu-split 22.0,22.0
+      python server_27b_layer.py --gpu-split 11.0,11.0
 
-  # TP3 (3×RTX 3090)
-  CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1,4 \\
-      python server_27b_tp2.py --gpu-split 22.0,22.0,22.0
+  # Single GPU
+  CUDA_VISIBLE_DEVICES=0 python server_27b_layer.py --gpu-split 22.0
 
 Environment variables (override CLI defaults):
-  MODEL_DIR, GPU_SPLIT, CACHE_TOKENS, HOST, PORT, TP_BACKEND,
+  MODEL_DIR, GPU_SPLIT, CACHE_TOKENS, HOST, PORT,
   DEFAULT_MAX_TOKENS (16000), MIN_MAX_TOKENS (12), MAX_MAX_TOKENS (16000)
 """
 
@@ -65,14 +65,15 @@ DEFAULT_GPU_SPLIT = [
 DEFAULT_CACHE_TOKENS = int(os.getenv("CACHE_TOKENS", "32768"))
 DEFAULT_HOST = os.getenv("HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PORT", "1234"))
-DEFAULT_TP_BACKEND = os.getenv("TP_BACKEND", "nccl")
+DEFAULT_TP_BACKEND = os.getenv("TP_BACKEND", "nccl")  # unused in layer-split, kept for compat
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "16000"))
 MIN_MAX_TOKENS = int(os.getenv("MIN_MAX_TOKENS", "12"))
 MAX_MAX_TOKENS = int(os.getenv("MAX_MAX_TOKENS", "16000"))
 ENABLE_THINKING = os.getenv("ENABLE_THINKING", "true").lower() in ("1", "true", "yes")
 PRESERVE_THINK_OUTPUT = os.getenv("PRESERVE_THINK_OUTPUT", "true").lower() in ("1", "true", "yes")
 ENABLE_STARTUP_WARMUP = os.getenv("EXLLAMA_STARTUP_WARMUP", "1").lower() in ("1", "true", "yes")
-# Cap on tokens spent inside the <think> block before forcing </think>.
+# Cap on tokens spent inside the <think> block before forcing </think> and moving to the response.
+# Prevents the model from "overthinking" and using the entire token budget on reasoning.
 MAX_THINKING_TOKENS = int(os.getenv("MAX_THINKING_TOKENS", "1024"))
 
 # ------------------------------------------------------------------
@@ -86,7 +87,7 @@ _cache_tokens: int = DEFAULT_CACHE_TOKENS
 _model_max_context: Optional[int] = None
 _gen_lock: asyncio.Lock
 
-app = FastAPI(title="Qwen3.5-27B heretic exl3 - TP multi-GPU server")
+app = FastAPI(title="Qwen3.5-27B heretic exl3 - layer-split multi-GPU server")
 
 
 # ------------------------------------------------------------------
@@ -106,6 +107,7 @@ class ChatCompletionRequest(BaseModel):
     min_p: Optional[float] = 0.08
     top_k: Optional[int] = 0
     stream: Optional[bool] = False
+    # Per-request thinking controls (None = use server defaults)
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
 
@@ -262,15 +264,25 @@ def generate_with_thinking_budget(
     stop_conditions: set,
     max_thinking: int,
 ):
-    """Two-phase generation that caps the <think> block to max_thinking tokens."""
+    """Two-phase generation that caps the <think> block to max_thinking tokens.
+
+    Phase 1: generate up to max_thinking tokens, stopping early at </think> if the
+             model finishes its reasoning on its own.  If the budget is exhausted
+             before </think> appears we forcibly inject </think> so the model is
+             compelled to produce an actual response.
+    Phase 2: concatenate the original prompt with the (capped) thinking block and
+             generate the real answer with the remaining token budget.
+    """
     assert _generator is not None and _tokenizer is not None
 
     think_end_id = _tokenizer.single_id("</think>")
+    # Phase-1 stop set: normal EOS tokens PLUS the </think> token so we stop as
+    # soon as thinking ends naturally.
     phase1_stop = set(stop_conditions)
     if think_end_id is not None:
         phase1_stop.add(think_end_id)
 
-    # Phase 1: generate reasoning, stopping at </think> or the thinking budget.
+    # ------------------------------------------------------------------ Phase 1
     sampler = make_sampler(request)
     job = Job(
         input_ids=input_ids,
@@ -298,6 +310,7 @@ def generate_with_thinking_budget(
                 if eos:
                     hit_think_end = "".join(think_pieces).rstrip().endswith("</think>")
 
+    # If the budget ran out without a closing tag, inject one and log it.
     if not hit_think_end:
         print(
             f"  [ThinkBudget] budget of {max_thinking} tokens exhausted — "
@@ -308,12 +321,14 @@ def generate_with_thinking_budget(
         if PRESERVE_THINK_OUTPUT:
             yield close_tag, False, think_tokens_used
 
-    # Phase 2: append the capped think block and generate the final answer.
+    # ------------------------------------------------------------------ Phase 2
+    # Build a new input tensor: original prompt ++ tokenised thinking block.
     full_thinking = "".join(think_pieces)
     think_encoded = _get_input_ids(
         _tokenizer.encode(full_thinking, add_bos=False, encode_special_tokens=True)
     )
     phase2_input = torch.cat([input_ids, think_encoded], dim=-1)
+
     phase2_max = max(1, max_new - think_tokens_used)
     if phase2_max <= 1:
         yield "", True, think_tokens_used
@@ -361,11 +376,11 @@ async def load_model():
 
     print(f"\n{'='*60}")
     num_gpus = len(gpu_split)
-    print(f"  Qwen3.5-27B-exl3 heretic - TP {num_gpus}-GPU server (cached)")
+    print(f"  Qwen3.5-27B-exl3 heretic - layer-split {num_gpus}-GPU server")
     print(f"{'='*60}")
     print(f"  Model dir    : {args.model}")
     print(f"  GPU split    : {gpu_split}")
-    print(f"  TP backend   : {args.tp_backend}")
+    print(f"  Mode         : layer-split (pipeline, no TP comms)")
     print(f"  Cache tokens : {_cache_tokens:,}")
     if _model_max_context is not None:
         print(f"  Model limit  : {_model_max_context:,}")
@@ -394,14 +409,9 @@ async def load_model():
     print(f"Creating fp16 KV cache ({_cache_tokens:,} tokens)...")
     cache = Cache(_model, max_num_tokens=_cache_tokens, layer_type=CacheLayer_fp16)
 
-    print("Loading weights (tensor parallel)...")
+    print("Loading weights (layer-split across GPUs)...")
     _model.load(
-        tensor_p=True,
         use_per_device=gpu_split,
-        tp_output_device=0,
-        tp_backend=args.tp_backend,
-        max_chunk_size=2048,
-        max_output_size=1,
         progressbar=True,
     )
 
@@ -491,6 +501,7 @@ async def chat_completions(request: ChatCompletionRequest):
     if _model is None or _tokenizer is None or _generator is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
+    # Resolve per-request thinking flag (None → use server default)
     use_thinking = ENABLE_THINKING if request.enable_thinking is None else request.enable_thinking
     effective_budget = (
         (request.thinking_budget if request.thinking_budget is not None else MAX_THINKING_TOKENS)
@@ -516,6 +527,7 @@ async def chat_completions(request: ChatCompletionRequest):
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
+    # Choose generator: two-phase with thinking budget, or plain single-phase.
     def _gen():
         if use_thinking and effective_budget > 0:
             return generate_with_thinking_budget(
@@ -593,7 +605,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     uvicorn.run(
-        "server_27b_tp2:app",
+        "server_27b_layer:app",
         host=args.host,
         port=args.port,
         log_level="info",
