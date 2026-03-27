@@ -1,0 +1,46 @@
+{
+  "tp_size": 1,
+  "mode": "single-GPU",
+  "gpu_split": [
+    22.0
+  ],
+  "gpu_names": [
+    "NVIDIA GeForce RTX 3090"
+  ],
+  "layer_split": false,
+  "cache_tokens": 4096,
+  "max_new_tokens": 200,
+  "tp_backend": "nccl",
+  "prompt_tokens": 74,
+  "avg_decode_tps": 19.46,
+  "avg_prefill_tps": 225.01,
+  "runs": [
+    {
+      "run": 1,
+      "gen_tokens": 199,
+      "total_time": 10.58,
+      "prefill_time": 0.4,
+      "decode_time": 10.18,
+      "decode_tps": 19.55,
+      "prefill_tps": 185.05
+    },
+    {
+      "run": 2,
+      "gen_tokens": 199,
+      "total_time": 10.5,
+      "prefill_time": 0.3,
+      "decode_time": 10.199,
+      "decode_tps": 19.51,
+      "prefill_tps": 246.42
+    },
+    {
+      "run": 3,
+      "gen_tokens": 199,
+      "total_time": 10.607,
+      "prefill_time": 0.304,
+      "decode_time": 10.303,
+      "decode_tps": 19.32,
+      "prefill_tps": 243.56
+    }
+  ]
+}

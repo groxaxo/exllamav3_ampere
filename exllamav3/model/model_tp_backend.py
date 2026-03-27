@@ -104,11 +104,13 @@ class TPBackendNCCL:
         # dist.broadcast(tensor, src = src_rank)
 
 
-    # Threshold below which FP16 cast overhead exceeds PCIe bandwidth savings.
-    # Decode tokens (bsz=1, seqlen=1, hdim=3584) = 3584 elements = 14KB — cast is slower
-    # than just sending FP32. Prefill tokens (seqlen=2048, hdim=3584) = 7M elements — FP16
-    # halves PCIe transfer time and is a clear win.
-    _FP16_CAST_THRESHOLD = int(os.environ.get("EXLLAMA_FP16_REDUCE_THRESHOLD", "0"))
+    # FP16 transport threshold for all_reduce.
+    # On Ampere (SM 8.x), the FP32→FP16 cast overhead is non-trivial for small
+    # decode tensors (e.g. [1, 1, 5632] = 22 KB).  Benchmarks show FP32 all_reduce
+    # is ~8% faster for tensors below ~65K elements on PCIe-connected 3090s, while
+    # FP16 transport is beneficial for large prefill tensors where PCIe BW dominates.
+    # Default: 65536 elements (≈128 KB FP32). Override with EXLLAMA_FP16_REDUCE_THRESHOLD.
+    _FP16_CAST_THRESHOLD = int(os.environ.get("EXLLAMA_FP16_REDUCE_THRESHOLD", "65536"))
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
         if self.world_size <= 1:
@@ -155,9 +157,8 @@ class TPBackendNCCL:
                 if src_rank == self.rank:
                     out_slice.copy_(tensor)
                 else:
-                    rbuf = torch.empty_like(out_slice)
-                    dist.recv(rbuf, src = src_rank)
-                    out_slice.copy_(rbuf)
+                    assert out_slice.is_contiguous(), "Gather destination slice must be contiguous"
+                    dist.recv(out_slice, src = src_rank)
         elif tensor.shape[-1] > 0:
             dist.send(tensor, dst = dst_rank)
 

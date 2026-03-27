@@ -220,6 +220,13 @@ def _strip_thinking(text: str) -> str:
     return text
 
 
+def _thinking_output_prefix(use_thinking: bool) -> str:
+    # The Qwen3.5 chat template already appends "<think>\n" to the generation
+    # prompt when enable_thinking=True, so the model's first streamed token IS
+    # that "<think>\n".  Do NOT inject it a second time here.
+    return ""
+
+
 def make_sampler(request: ChatCompletionRequest):
     from exllamav3.generator.sampler.custom import SS_Temperature, SS_TopK, SS_TopP, SS_MinP, SS_Sample, SS_Argmax
     temp = request.temperature if request.temperature is not None else 0.7
@@ -525,6 +532,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    think_prefix = _thinking_output_prefix(use_thinking)
 
     def _gen():
         if use_thinking and effective_budget > 0:
@@ -536,6 +544,15 @@ async def chat_completions(request: ChatCompletionRequest):
     if request.stream:
         async def generate_stream():
             async with _gen_lock:
+                if think_prefix:
+                    data = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": _model_name,
+                        "choices": [{"index": 0, "delta": {"content": think_prefix}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
                 for chunk, eos, _ntok in _gen():
                     if chunk:
                         data = {
@@ -560,7 +577,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
     async with _gen_lock:
-        pieces = []
+        pieces = [think_prefix] if think_prefix else []
         completion_tokens = 0
         for piece, eos, ntok in _gen():
             pieces.append(piece)

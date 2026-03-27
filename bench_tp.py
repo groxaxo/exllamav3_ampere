@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Benchmark script for Qwen3.5-27B-exl3 TP decode throughput.
-Tests TP2 and TP3 configurations on RTX 3090 GPUs.
+Benchmark script for Qwen3.5-27B-exl3 decode throughput.
+Tests single-GPU and tensor-parallel configurations on RTX 3090 GPUs.
 
 Usage:
     # Run inside the exl3-dev conda env
     cd /home/op/exllamav3_ampere
+    python bench_tp.py --tp 1   # 1×RTX 3090
     python bench_tp.py --tp 2   # 2×RTX 3090
     python bench_tp.py --tp 3   # 3×RTX 3090
 """
@@ -16,12 +17,17 @@ import time
 import argparse
 import json
 
-torch_lib = "/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages/torch/lib"
-if os.path.exists(torch_lib):
-    os.environ.setdefault(
-        "LD_LIBRARY_PATH",
-        torch_lib + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
-    )
+site_packages = "/home/op/miniconda3/envs/exl3-dev/lib/python3.11/site-packages"
+lib_paths = [
+    f"{site_packages}/nvidia/cuda_runtime/lib",
+    f"{site_packages}/nvidia/nccl/lib",
+    f"{site_packages}/torch/lib",
+]
+lib_paths = [path for path in lib_paths if os.path.isdir(path)]
+if lib_paths:
+    current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    prepend = ":".join(lib_paths)
+    os.environ["LD_LIBRARY_PATH"] = prepend + (":" + current_ld if current_ld else "")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,7 +42,7 @@ from exllamav3.cache import CacheLayer_fp16
 from exllamav3.generator.sampler.presets import ArgmaxSampler
 from exllamav3.constants import PAGE_SIZE
 
-MODEL_DIR = "/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3"
+DEFAULT_MODEL_DIR = "/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3"
 
 PROMPT = (
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
@@ -55,14 +61,26 @@ def align_to_page(n: int) -> int:
 
 
 def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
-                  max_new_tokens: int, num_runs: int, tp_backend: str):
+                  max_new_tokens: int, num_runs: int, tp_backend: str,
+                  layer_split: bool = False, model_dir: str = DEFAULT_MODEL_DIR):
     print(f"\n{'='*70}")
-    print(f"  BENCHMARK: TP{tp_size} on {tp_size}×RTX 3090")
+    if layer_split:
+        mode_label = f"layer-split-{tp_size}GPU"
+    elif tp_size == 1:
+        mode_label = "single-GPU"
+    else:
+        mode_label = f"TP{tp_size}"
+    gpu_names = []
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        gpu_names.append(p.name)
+    print(f"  BENCHMARK: {mode_label}")
     print(f"{'='*70}")
     print(f"  GPU split    : {gpu_split}")
+    print(f"  Mode         : {'layer-split (pipeline)' if layer_split else ('tensor-parallel' if tp_size > 1 else 'single-GPU')}")
     print(f"  Cache tokens : {cache_tokens:,}")
     print(f"  Max new tok  : {max_new_tokens}")
-    print(f"  TP backend   : {tp_backend}")
+    print(f"  TP backend   : {tp_backend if not layer_split else 'n/a (layer-split)'}")
     print(f"  Runs         : {num_runs}")
 
     num_visible = torch.cuda.device_count()
@@ -83,23 +101,35 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
     cache_tokens = align_to_page(cache_tokens)
 
     print("\nLoading model config...")
-    cfg = Config.from_directory(MODEL_DIR)
+    cfg = Config.from_directory(model_dir)
     model = Model.from_config(cfg)
 
     print(f"Creating fp16 KV cache ({cache_tokens:,} tokens)...")
     cache = Cache(model, max_num_tokens=cache_tokens, layer_type=CacheLayer_fp16)
 
-    print("Loading weights (tensor parallel)...")
+    use_tensor_parallel = tp_size > 1 and not layer_split
+    load_mode_str = "layer-split" if layer_split else ("tensor parallel" if use_tensor_parallel else "single GPU")
+    print(f"Loading weights ({load_mode_str})...")
     t0 = time.time()
-    model.load(
-        tensor_p=True,
-        use_per_device=gpu_split,
-        tp_output_device=0,
-        tp_backend=tp_backend,
-        max_chunk_size=2048,
-        max_output_size=1,
-        progressbar=True,
-    )
+    if layer_split or not use_tensor_parallel:
+        # Layer-split: loads each layer onto the device that has the most free VRAM.
+        # EXLLAMA_EMBED_PREFER_CPU=0 keeps embeddings on GPU for fully-GPU inference.
+        import os as _os
+        _os.environ.setdefault("EXLLAMA_EMBED_PREFER_CPU", "0")
+        model.load(
+            use_per_device=gpu_split,
+            progressbar=True,
+        )
+    else:
+        model.load(
+            tensor_p=use_tensor_parallel,
+            use_per_device=gpu_split,
+            tp_output_device=0,
+            tp_backend=tp_backend,
+            max_chunk_size=2048,
+            max_output_size=1,
+            progressbar=True,
+        )
     load_time = time.time() - t0
     print(f"Model loaded in {load_time:.1f}s")
 
@@ -179,7 +209,7 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
     avg_tps = sum(r["decode_tps"] for r in results) / len(results)
     avg_prefill = sum(r["prefill_tps"] for r in results) / len(results)
     print(f"\n{'='*70}")
-    print(f"  RESULTS: TP{tp_size}")
+    print(f"  RESULTS: {mode_label}")
     print(f"{'='*70}")
     print(f"  Avg decode:  {avg_tps:.2f} t/s")
     print(f"  Avg prefill: {avg_prefill:.2f} t/s")
@@ -188,10 +218,14 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
 
     summary = {
         "tp_size": tp_size,
+        "mode": mode_label,
         "gpu_split": gpu_split,
+        "gpu_names": gpu_names[:tp_size],
+        "layer_split": layer_split,
         "cache_tokens": cache_tokens,
         "max_new_tokens": max_new_tokens,
-        "tp_backend": tp_backend,
+        "tp_backend": tp_backend if not layer_split else "n/a",
+        "nccl_algo": os.environ.get("NCCL_ALGO") if use_tensor_parallel and tp_backend == "nccl" else None,
         "prompt_tokens": prompt_len,
         "avg_decode_tps": round(avg_tps, 2),
         "avg_prefill_tps": round(avg_prefill, 2),
@@ -207,23 +241,29 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TP benchmark for Qwen3.5-27B-exl3")
-    parser.add_argument("--tp", type=int, required=True, choices=[2, 3],
-                        help="Tensor parallel size (2 or 3)")
+    parser = argparse.ArgumentParser(description="Decode benchmark for Qwen3.5-27B-exl3")
+    parser.add_argument("--tp", type=int, default=1, choices=[1, 2, 3],
+                        help="GPU count: 1 for single-GPU, 2/3 for tensor-parallel or layer-split")
+    parser.add_argument("--mode", default="tp", choices=["tp", "layer_split"],
+                        help="Inference mode: 'tp' for tensor-parallel (default) or 'layer_split' for pipeline")
     parser.add_argument("--cache-tokens", type=int, default=32768)
     parser.add_argument("--max-new-tokens", type=int, default=500)
     parser.add_argument("--num-runs", type=int, default=3)
     parser.add_argument("--tp-backend", default="nccl")
     parser.add_argument("--gpu-split", default=None,
                         help="Comma-separated GB per GPU (default: 22.0 per GPU)")
+    parser.add_argument("--model", default=DEFAULT_MODEL_DIR,
+                        help="Path to model directory (default: Qwen3.5-27B-exl3)")
     parser.add_argument("--output", default=None,
-                        help="Write JSON results to file")
+                        help="Write JSON results to file (default: auto-named with timestamp)")
     args = parser.parse_args()
 
     if args.gpu_split:
         gpu_split = [float(x) for x in args.gpu_split.split(",")]
     else:
         gpu_split = [22.0] * args.tp
+
+    layer_split = args.mode == "layer_split"
 
     summary = run_benchmark(
         tp_size=args.tp,
@@ -232,9 +272,14 @@ def main():
         max_new_tokens=args.max_new_tokens,
         num_runs=args.num_runs,
         tp_backend=args.tp_backend,
+        layer_split=layer_split,
+        model_dir=args.model,
     )
 
-    out_file = args.output or f"bench_tp{args.tp}_results.json"
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    mode_tag = "ls" if layer_split else "tp"
+    default_out = f"bench_{mode_tag}{args.tp}_{ts}.json"
+    out_file = args.output or default_out
     with open(out_file, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"Results saved to {out_file}")

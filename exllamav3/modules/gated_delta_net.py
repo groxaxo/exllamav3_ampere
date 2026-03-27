@@ -261,6 +261,10 @@ class GDN_RecurrentState(CacheableState):
         )
 
     def collect_batch(self, batch: list[GDN_RecurrentState]):
+        # If all states are uninitialized (first token before any GDN forward pass),
+        # return an empty state; the GDN forward will initialize zeros per-batch-item.
+        if all(b.last_conv_state is None for b in batch):
+            return GDN_RecurrentState()
         lcs = torch.cat([b.last_conv_state for b in batch], dim=0)
         lrs = torch.cat([b.last_recurrent_state for b in batch], dim=0)
         positions = [b.position for b in batch]
@@ -834,6 +838,7 @@ class GatedDeltaNet(Module):
                     self.num_v_heads,
                     self.k_head_dim,
                     self.v_head_dim,
+                    getattr(self.config, "beta_scale", 1.0),
                 )
             else:
                 # TODO: Bound class and/or graph for this part
@@ -857,7 +862,15 @@ class GatedDeltaNet(Module):
                     device=self.device,
                 )
 
-                ext.gated_delta_net_fused_op_2(b, a, self.dt_bias, self.a_log, beta, g)
+                ext.gated_delta_net_fused_op_2(
+                    b,
+                    a,
+                    self.dt_bias,
+                    self.a_log,
+                    beta,
+                    g,
+                    getattr(self.config, "beta_scale", 1.0),
+                )
 
             # Convolution
             # TODO: Figure out an alternative or write a new kernel that won't require transposing qkv back and forth

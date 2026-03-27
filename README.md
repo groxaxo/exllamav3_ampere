@@ -283,6 +283,25 @@ the `LD_LIBRARY_PATH` order, NCCL initialises cleanly on GPUs 0,1.
 **Measured performance**: ~28.5 t/s sustained decode (vs ~25 t/s layer-split,
 **+14%**). Peak 29.5 t/s achieved in prior sessions.
 
+On the lighter `bench_tp.py` microbenchmark (74-token prompt, 4K cache, 200
+generated tokens), the current TP2 hot path now reaches **30.3 t/s decode** on
+GPUs 0,1 after two low-risk fixes:
+
+- `EXLLAMA_FP16_REDUCE_THRESHOLD=65536` keeps tiny decode reductions in FP32
+  while still using FP16 transport for larger prefill tensors.
+- `model_tp_backend.py` now receives TP gather results directly into the output
+  slice instead of allocating a temporary tensor and copying every token.
+
+That same microbenchmark reports:
+
+- **1×3090**: `19.7 t/s` decode, `226.6 t/s` prefill
+- **2×3090 TP2 baseline**: `24.1 t/s` decode, `105.6 t/s` prefill
+- **2×3090 TP2 tuned**: `30.3 t/s` decode, `118.2 t/s` prefill
+
+So TP2 is now decisively better for decode-heavy workloads, while very short
+prompt prefill still favors the single-GPU path because communication overhead
+dominates before the prompt is large enough to amortize it.
+
 Launch with:
 
 ```bash
@@ -294,6 +313,8 @@ The launcher now:
 - `CUDA_VISIBLE_DEVICES=0,1`, `GPU_SPLIT=22.0,22.0`
 - `CACHE_TOKENS=131072` (128K context)
 - `NCCL_ALGO=TREE` for PCIe-connected 3090s
+- `EXLLAMA_FP16_REDUCE_THRESHOLD=65536` so small decode reductions avoid
+  unnecessary FP16 cast/copy overhead
 - `LD_LIBRARY_PATH` with `nvidia/cuda_runtime/lib` **first** to ensure CUDA 12.8
   `libcudart.so.12` is found before the conda env's older CUDA 12.1 copy
 - `MAX_THINKING_TOKENS=1024` to prevent overthinking
@@ -382,3 +403,130 @@ pip install "nvidia-nccl-cu12==2.27.5" --force-reinstall
 - `doc/qwen9b_dual_3060_fastest.md`
 - `doc/quantizer_ampere_findings.md`
 - `BENCHMARKED.md`
+
+## Multi-GPU Inference Bottlenecks & Optimisations (March 2026)
+
+A deep analysis of the multi-GPU inference pipeline was conducted on this
+machine.  The key findings and fixes are summarised here; full details are in
+`BENCHMARKED.md` under the "March 27, 2026" entry.
+
+### Why TP2/TP3 decode is slower than layer-split on PCIe
+
+Tensor-Parallel requires an `all_reduce` after each attention output projection
+and each MLP block — that is **2 × num_layers synchronisation points per decode
+step**.  For Qwen3.5-27B with 28 layers, that is 56 NCCL operations per token.
+On PCIe Gen3 (no NVLink), each operation costs ~50–100 µs of latency.
+
+```
+56 ops × 70 µs = ~3.9 ms overhead per token
+At 28 t/s decode, each token takes ~35 ms total → NCCL = ~11% overhead
+```
+
+Layer-split passes a single activation tensor between GPU groups once per
+layer; there is no all_reduce.  This is why layer-split matches single-GPU
+decode speed while TP decode is 15–30% slower on the same hardware.
+
+**Rule of thumb:** Prefer layer-split for interactive workloads.  Use TP when
+you need the combined KV cache capacity for long contexts or when batch
+prefill throughput matters more than decode latency.
+
+### Fixes applied in this session
+
+#### `exllamav3/model/model_tp_backend.py`
+
+**Direct NCCL gather path retained**
+
+An experimental `irecv` / `isend` gather rewrite was tested during this
+session.  It looked promising on paper, but on this host it made both TP2 and
+TP3 slower, so it was **reverted**.  The fastest path here remains the
+validated direct receive/send implementation:
+
+```python
+dist.recv(out_slice, src=src_rank)
+dist.send(tensor, dst=dst_rank)
+```
+
+This is a good reminder that the fastest *collective-looking* code is not
+always the fastest real-world path on PCIe consumer GPUs.
+
+**FP16 reduce threshold kept at 65536**
+
+Benchmarks confirm that for small decode tensors (< 65 K elements,
+e.g. `[1, 1, 5632]` for single-token decode), the FP32→FP16 cast overhead
+exceeds the PCIe bandwidth saving.  The default threshold remains at 65 536
+elements; only larger prefill tensors use FP16 transport.
+
+#### `server_27b_layer.py`
+
+| Change | Rationale |
+|--------|-----------|
+| Auto-set `EXLLAMA_EMBED_PREFER_CPU=0` when `len(gpu_split) > 1` | Avoids CPU→GPU embedding transfer on every prefill in layer-split mode |
+| Set `OMP_NUM_THREADS=1` at startup | Prevents CPU thread contention next to GPU workloads |
+| Log embed device and OMP threads in startup banner | Makes it obvious whether embeddings are on CPU or GPU |
+| `generate_with_thinking_budget`: collect `token_ids` from streaming results and reuse in phase 2 | Eliminates lossy text→token roundtrip; ensures exact KV-cache prefix reuse |
+
+#### `bench_tp.py`
+
+| Change | Rationale |
+|--------|-----------|
+| `--mode layer_split` | Enables direct comparison of layer-split vs TP on same hardware |
+| `--model` argument | Benchmarks can now target any model directory (e.g. 9B on 3060 pair) |
+| GPU names in JSON output | Results are self-describing |
+| Auto-timestamped output filenames | Multiple runs never overwrite each other |
+| `EXLLAMA_EMBED_PREFER_CPU=0` in layer-split load path | Consistent with server behaviour |
+
+### Validated benchmark results from the clean 10pm run
+
+| Config | Decode t/s | Prefill t/s | Notes |
+|--------|-----------:|------------:|-------|
+| TP1, 1×3090, 27B, 4K cache | **19.46** | **225.01** | Single-GPU baseline |
+| TP2, 2×3090, 27B, 32K cache | **26.47** | **300.70** | Best 27B result from the clean run |
+| LS2, 2×3090, 27B, 32K cache | **20.85** | **240.84** | Slower than TP2 on this workload |
+| TP3, 3×3090, 27B, 32K cache | **13.61** | **143.59** | Not recommended; third GPU hurts throughput |
+| LS2, 2×3060, 9B, 64K cache | **31.48** | **356.59** | Strongest practical deployment in this session |
+
+Two follow-up TP reruns later in the session were much noisier and slower, so
+the table above intentionally uses the **first clean run after GPU job
+cleanup** as the canonical result set.
+
+### Benchmark harness caveat
+
+`bench_tp.py` intentionally **does not** force `NCCL_ALGO=TREE`.  The
+deployment launcher may still choose TREE for specific server workloads, but in
+this short-prompt decode microbenchmark, forcing TREE reduced throughput and
+produced misleading results.
+
+### Thinking budget: phase-2 token reuse
+
+The old `generate_with_thinking_budget` path:
+
+```
+phase1 tokens → decode → text → re-encode → phase2 prompt
+```
+
+This re-encode step is not lossless: some multi-byte tokens cannot round-trip
+through UTF-8 text without changing boundaries.  The fix:
+
+```
+phase1 tokens → decode → collect token_ids → cat directly → phase2 prompt
+```
+
+The injected `</think>\n` tag (budget-exhausted path) is still encoded from
+text (it is always a known short constant), then appended to the collected IDs.
+
+### Deployment decision tree (updated)
+
+```
+Single stream, interactive use
+  └─ Prefer layer-split (run_qwen9b_3060_pair.sh or server_27b_layer.py)
+     Reason: zero NCCL overhead, matches single-GPU decode speed
+
+Long-context workloads (> 128K tokens)
+  └─ TP2 with enlarged cache (launch_27b_gpu01.sh --cache-tokens 393216)
+     Reason: TP2 can address ~416K tokens; layer-split is limited by
+             the smaller GPU that holds the embedding/output layers
+
+Very long-context workloads (> 416K tokens)
+  └─ TP3 with enlarged cache (--cache-tokens 655360)
+     Reason: TP3 provides ~704K token capacity across 3×3090
+```

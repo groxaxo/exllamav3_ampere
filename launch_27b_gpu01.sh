@@ -22,6 +22,7 @@ PRESERVE_THINK_OUTPUT="${PRESERVE_THINK_OUTPUT:-true}"
 MAX_THINKING_TOKENS="${MAX_THINKING_TOKENS:-1024}"
 EXLLAMA_EMBED_PREFER_CPU="${EXLLAMA_EMBED_PREFER_CPU:-0}"
 EXLLAMA_STARTUP_WARMUP="${EXLLAMA_STARTUP_WARMUP:-1}"
+EXLLAMA_FP16_REDUCE_THRESHOLD="${EXLLAMA_FP16_REDUCE_THRESHOLD:-65536}"
 # NCCL tuning for PCIe-connected 3090s (no NVLink)
 NCCL_ALGO="${NCCL_ALGO:-TREE}"
 TP_BACKEND="${TP_BACKEND:-nccl}"
@@ -53,6 +54,7 @@ printf '  Model ID    : %s\n' "$MODEL_ID"
 printf '  GPU split   : %s\n' "$GPU_SPLIT"
 printf '  Cache tokens: %s\n' "$CACHE_TOKENS"
 printf '  TP backend  : %s (NCCL_ALGO=%s)\n' "$TP_BACKEND" "$NCCL_ALGO"
+printf '  Reduce thr  : %s\n' "$EXLLAMA_FP16_REDUCE_THRESHOLD"
 printf '  Max tokens  : %s\n' "$DEFAULT_MAX_TOKENS"
 printf '  Thinking    : %s (preserve=%s, budget=%s)\n' "$ENABLE_THINKING" "$PRESERVE_THINK_OUTPUT" "$MAX_THINKING_TOKENS"
 printf '  Log file    : %s\n' "$LOGFILE"
@@ -83,6 +85,7 @@ export PRESERVE_THINK_OUTPUT
 export MAX_THINKING_TOKENS
 export EXLLAMA_EMBED_PREFER_CPU
 export EXLLAMA_STARTUP_WARMUP
+export EXLLAMA_FP16_REDUCE_THRESHOLD
 export NCCL_ALGO
 export TP_BACKEND
 export PORT

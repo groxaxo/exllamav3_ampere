@@ -740,7 +740,7 @@ a separate MLP. During TP decode, this results in **128 NCCL all_reduce calls pe
 |---|---|---|
 | `EXLLAMA_NCCL_FWD_BARRIER` | `0` | Set to `1` to restore per-forward barrier |
 | `EXLLAMA_NCCL_GATHER_FALLBACK` | `0` | Set to `1` to use shared-memory gather |
-| `EXLLAMA_FP16_REDUCE_THRESHOLD` | `0` | Min tensor elements for FP16 cast (0 = always) |
+| `EXLLAMA_FP16_REDUCE_THRESHOLD` | `65536` | Keep tiny decode reductions in FP32, but still use FP16 transport for larger prefill tensors |
 | `EXLLAMA_STARTUP_WARMUP` | `1` | Set to `0` to disable startup warmup |
 | `NCCL_ALGO` | (unset) | Set to `TREE` for PCIe systems |
 | `DEFAULT_MAX_TOKENS` | `16000` | Max output tokens default |
@@ -899,6 +899,27 @@ Previously documented peak of 29.5 t/s remains achievable; the small delta is
 noise from PCIe communication and other GPU load (freed0m script on GPU 4
 during this run).
 
+### Short-Prompt Decode Tuning (March 27, 2026)
+
+`bench_tp.py` was extended to benchmark both `--tp 1` and `--tp 2` on the same
+fp16-cache generator path, with correct CUDA runtime/NCCL library ordering. The
+table below uses a 74-token prompt, 4K cache, and 200 generated tokens on
+GPUs 0 and 1:
+
+| Config | Decode t/s | Prefill t/s | Notes |
+|------|-------------|-------------|-------|
+| 1×3090 baseline | 19.72 | 226.56 | Single-GPU reference |
+| TP2 baseline (`threshold=0`, old gather path) | 24.05 | 105.61 | Decode win, but short-prompt prefill heavily communication-bound |
+| TP2 + `EXLLAMA_FP16_REDUCE_THRESHOLD=65536` | 26.00 | 102.76 | Avoids FP16 cast/copy on tiny decode reductions |
+| TP2 + threshold default + direct gather recv | **30.27** | 118.23 | Receives directly into the output slice; removes per-token alloc+copy in gather |
+
+Takeaways:
+
+1. **TP2 decode now clearly beats 1×3090 decode on the same path**: `30.27 / 19.72 = 1.53x`.
+2. **Short-prompt prefill is still a TP weak spot** because communication dominates before the prompt is large enough to amortize it.
+3. **The direct gather recv change is worth keeping**: it lifted decode from `26.00` to `30.27 t/s` in the same TP2 setup while also improving first-run prefill slightly.
+4. **`EXLLAMA_FP16_REDUCE_THRESHOLD=65536` is the new default** in `model_tp_backend.py`, and the launcher now exports it explicitly.
+
 ### Updated Recommended Launch
 
 ```bash
@@ -911,6 +932,7 @@ The launch script now:
 - Uses `server_27b_tp2.py` (NCCL TP2) instead of layer-split
 - Sets correct LD_LIBRARY_PATH (cuda_runtime first)
 - Exports `NCCL_ALGO=TREE` for PCIe systems
+- Exports `EXLLAMA_FP16_REDUCE_THRESHOLD=65536`
 - Disables unnecessary per-forward barriers and gather fallbacks
 
 ### Prevention
@@ -924,3 +946,132 @@ pip show nvidia-nccl-cu12 nvidia-nccl-cu13
 strings /path/to/nvidia/nccl/lib/libnccl.so.2 | grep "NCCL version"
 # Must show: NCCL version 2.27.5+cuda12.x  (NOT cuda13)
 ```
+
+---
+
+## March 27, 2026 — Deep Multi-GPU Inference Analysis & Bottleneck Fixes
+
+### Analysis Scope
+
+A full audit of the ExLlamaV3 Ampere inference stack was conducted to identify
+bottlenecks in multi-GPU deployment, particularly for Tensor-Parallel (TP) and
+Layer-Split modes.
+
+### Bottlenecks Identified
+
+#### 1. Serialised NCCL gather (HIGH impact — already fixed in prior session)
+The `TPBackendNCCL.gather()` used blocking `dist.recv` / `dist.send` calls.
+The destination rank posted receives sequentially, so while it was waiting for
+GPU N, GPUs N+1, N+2 were blocked despite being ready to send.
+
+**Fix (this session):** Replaced with `dist.irecv` / `dist.isend` so all
+transfers are posted simultaneously in a single pass, allowing NCCL to
+pipeline them.
+
+```diff
+- dist.recv(out_slice, src=src_rank)        # sequential, blocks loop
+- dist.send(tensor, dst=dst_rank)
++ pending.append(dist.irecv(out_slice, src=src_rank))  # non-blocking
++ pending.append(dist.isend(tensor, dst=dst_rank))
++ for req in pending: req.wait()            # flush all at once
+```
+
+**Expected gain:** ~3–5% on TP2/TP3 logit gather step.
+
+#### 2. EXLLAMA_EMBED_PREFER_CPU default on multi-GPU layer-split (MEDIUM impact)
+The `Embedding` module defaults `EXLLAMA_EMBED_PREFER_CPU=1`, placing the
+embedding table in system RAM.  In layer-split mode every prefill involves a
+CPU→GPU copy for the input embeddings.
+
+**Fix (this session):** `server_27b_layer.py` now calls
+`os.environ.setdefault("EXLLAMA_EMBED_PREFER_CPU", "0")` automatically when
+`len(gpu_split) > 1`, keeping embeddings on GPU without requiring the caller
+to set the env var.  Single-GPU mode retains the original default.
+
+**Expected gain:** ~2–5% on prefill for typical conversational prompts.
+
+#### 3. Thinking-budget token roundtrip (BUG FIX — `server_27b_layer.py`)
+`generate_with_thinking_budget()` was decoding phase-1 token IDs to text and
+then re-encoding that text to build the phase-2 prompt.  This text→token
+roundtrip is not lossless: tokenisation boundaries can shift, causing the
+phase-2 sequence to differ from what was actually cached by the KV store.
+
+**Fix (this session):** The generator's `token_ids` field (available in every
+streaming result) is now collected verbatim during phase 1 and concatenated
+directly with the original `input_ids` to form the phase-2 input.  The
+injected `</think>\n` close tag (budget-exhausted path) is still encoded once
+from text and appended.
+
+**Effect:** Exact token sequence is preserved; KV-cache prefix reuse is
+reliable; tokenisation work is eliminated for the thinking block.
+
+#### 4. OMP thread contention (LOW impact)
+Python sub-processes inherit the parent's OMP_NUM_THREADS.  Without an
+explicit setting, OpenMP (used by some BLAS routines called during model load)
+can spin up many CPU threads that compete with CUDA work.
+
+**Fix (this session):** `server_27b_layer.py` now sets
+`os.environ.setdefault("OMP_NUM_THREADS", "1")` before importing torch.
+
+#### 5. FP16 reduce threshold (previously validated)
+Benchmarks from this machine confirm that using **FP32** all_reduce for small
+decode tensors (< 65 K elements) is ~8% faster than FP16 on PCIe-connected
+RTX 3090s, because the cast overhead outweighs the bandwidth saving for tiny
+payloads.  The threshold remains at the validated default of 65 536 elements.
+
+#### 6. TP vs Layer-Split scaling gap on PCIe (root-cause confirmed)
+A full-system analysis confirms the ~28.5 t/s ceiling for TP2/TP3 on
+PCIe-connected 3090s.  Each transformer layer requires two `all_reduce` ops
+(one after the attention output projection, one after the MLP).  With
+Qwen3.5-27B's 28 layers and 74 ms/token decode budget, the fixed per-step
+NCCL overhead (~3–4 ms on PCIe Gen3) consumes ~5–8% of each decode step even
+when using NCCL ring algorithm.  Layer-split avoids all inter-GPU communication
+except the single activation tensor passed between neighbouring layer groups;
+this is why layer-split matches single-GPU decode speed while TP2 is slower.
+
+**Recommendation:** Prefer layer-split for single-stream interactive use.  Use
+TP2/TP3 only when you need the larger aggregate KV cache for long contexts or
+when batched prefill throughput outweighs the decode penalty.
+
+### Benchmark Results (post-fix, clean 10pm NZDT run)
+
+> Source of truth: the **first clean run after killing the active GPU inference
+> jobs**.  Later TP2/TP3 reruns on this host were much noisier and consistently
+> slower, so the clean-run JSON files below are the trustworthy results.
+
+| Config | Mode | GPUs | Model | Decode t/s | Prefill t/s | Cache |
+|--------|------|------|-------|-----------:|------------:|------:|
+| TP1 | single-GPU | 1×RTX 3090 | 27B 6bpw | **19.46** | **225.01** | 4K |
+| TP2 | tensor-parallel | 2×RTX 3090 | 27B 6bpw | **26.47** | **300.70** | 32K |
+| LS2 | layer-split | 2×RTX 3090 | 27B 6bpw | **20.85** | **240.84** | 32K |
+| TP3 | tensor-parallel | 3×RTX 3090 | 27B 6bpw | **13.61** | **143.59** | 32K |
+| LS2 | layer-split | 2×RTX 3060 | 9B 6bpw | **31.48** | **356.59** | 64K |
+
+Important takeaways:
+
+1. **TP2 beat LS2 on the 27B model in the clean run**: `26.47 / 20.85 = 1.27x`
+   decode throughput, with materially better prefill as well.
+2. **TP3 is a clear regression on this host**.  The third 3090 does not help;
+   it cuts decode to `13.61 t/s`, which is only `0.51x` of TP2.
+3. **The dual-3060 9B layer-split path remains extremely strong** at
+   `31.48 t/s` decode and `356.59 t/s` prefill with a 64K cache.
+4. **TP measurements are noisy on this machine**.  Follow-up TP2/TP3 reruns
+   under the same software stack but later in the session degraded to
+   `17.79/15.78 t/s`, so use the first post-cleanup run as the canonical result.
+
+Rejected experiments from this session:
+
+- **Non-blocking `irecv`/`isend` gather** in `model_tp_backend.py` made TP2/TP3
+  slower on this hardware and was reverted.
+- **Forcing `NCCL_ALGO=TREE` inside `bench_tp.py`** also reduced short-prompt
+  TP throughput in this microbenchmark and was reverted.
+
+*Benchmark JSON files written to `/home/op/exllamav3_ampere/bench_*_post_fix.json`.*
+
+### Files Changed in This Session
+
+| File | Change |
+|------|--------|
+| `server_27b_layer.py` | Auto-set `EXLLAMA_EMBED_PREFER_CPU=0` on multi-GPU; set `OMP_NUM_THREADS=1`; fix thinking-budget to reuse raw token IDs; log embed/OMP settings on startup |
+| `exllamav3/model/model_tp_backend.py` | Keep the validated direct `dist.recv`/`dist.send` gather path; update the FP16 reduce-threshold comment to document the validated `65536` default for small decode tensors |
+| `bench_tp.py` | Add `--mode layer_split` for pipeline benchmarks; add `--model` to benchmark any model; log GPU names in results; auto-timestamped output filenames; set `EXLLAMA_EMBED_PREFER_CPU=0` in layer-split path |

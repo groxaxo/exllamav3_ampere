@@ -39,6 +39,9 @@ if os.path.exists(torch_lib):
         torch_lib + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
     )
 
+# Prevent CPU thread over-subscription next to GPU workloads.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -272,6 +275,10 @@ def generate_with_thinking_budget(
              compelled to produce an actual response.
     Phase 2: concatenate the original prompt with the (capped) thinking block and
              generate the real answer with the remaining token budget.
+
+    Token IDs from phase 1 are collected directly from the streaming results and
+    reused verbatim in phase 2, avoiding a lossy text→token roundtrip that can
+    cause token count drift and context mismatches.
     """
     assert _generator is not None and _tokenizer is not None
 
@@ -293,6 +300,7 @@ def generate_with_thinking_budget(
     _generator.enqueue(job)
 
     think_pieces: list[str] = []
+    think_id_chunks: list[torch.Tensor] = []  # raw token IDs from the generator
     think_tokens_used = 0
     hit_think_end = False
 
@@ -300,17 +308,21 @@ def generate_with_thinking_budget(
         for r in _generator.iterate():
             if r.get("stage") == "streaming":
                 text = r.get("text", "")
+                tids = r.get("token_ids")
                 eos = r.get("eos", False)
                 if r.get("new_tokens") is not None:
                     think_tokens_used = r["new_tokens"]
                 if text:
                     think_pieces.append(text)
-                    if PRESERVE_THINK_OUTPUT:
-                        yield text, False, think_tokens_used
+                if tids is not None:
+                    think_id_chunks.append(tids.cpu().view(-1))
+                if text and PRESERVE_THINK_OUTPUT:
+                    yield text, False, think_tokens_used
                 if eos:
                     hit_think_end = "".join(think_pieces).rstrip().endswith("</think>")
 
     # If the budget ran out without a closing tag, inject one and log it.
+    injected_close_ids: Optional[torch.Tensor] = None
     if not hit_think_end:
         print(
             f"  [ThinkBudget] budget of {max_thinking} tokens exhausted — "
@@ -320,14 +332,30 @@ def generate_with_thinking_budget(
         think_pieces.append(close_tag)
         if PRESERVE_THINK_OUTPUT:
             yield close_tag, False, think_tokens_used
+        # Encode only the short injected tag to append to the token stream.
+        injected_close_ids = _get_input_ids(
+            _tokenizer.encode(close_tag, add_bos=False, encode_special_tokens=True)
+        ).cpu().view(-1)
 
     # ------------------------------------------------------------------ Phase 2
-    # Build a new input tensor: original prompt ++ tokenised thinking block.
-    full_thinking = "".join(think_pieces)
-    think_encoded = _get_input_ids(
-        _tokenizer.encode(full_thinking, add_bos=False, encode_special_tokens=True)
-    )
-    phase2_input = torch.cat([input_ids, think_encoded], dim=-1)
+    # Build phase-2 input from actual token IDs (no lossy text→token roundtrip).
+    # Fall back to re-encoding only if no IDs were collected (shouldn't happen).
+    if think_id_chunks or injected_close_ids is not None:
+        all_chunks = think_id_chunks
+        if injected_close_ids is not None:
+            all_chunks = all_chunks + [injected_close_ids]
+        if all_chunks:
+            think_tensor = torch.cat(all_chunks, dim=0).unsqueeze(0)
+        else:
+            think_tensor = torch.zeros((1, 0), dtype=torch.long)
+        phase2_input = torch.cat([input_ids.cpu(), think_tensor], dim=-1)
+    else:
+        # Fallback: re-encode the collected text (may diverge from actual tokens).
+        full_thinking = "".join(think_pieces)
+        think_encoded = _get_input_ids(
+            _tokenizer.encode(full_thinking, add_bos=False, encode_special_tokens=True)
+        )
+        phase2_input = torch.cat([input_ids, think_encoded], dim=-1)
 
     phase2_max = max(1, max_new - think_tokens_used)
     if phase2_max <= 1:
@@ -374,6 +402,14 @@ async def load_model():
     _model_max_context = _read_model_max_context(args.model)
     _model_name = os.getenv("MODEL_ID", os.path.basename(args.model.rstrip("/")))
 
+    # On multi-GPU layer-split, keep embeddings on GPU by default to avoid
+    # the CPU→GPU transfer on every prefill.  The caller can still override
+    # by exporting EXLLAMA_EMBED_PREFER_CPU=1 before launching.
+    if len(gpu_split) > 1:
+        os.environ.setdefault("EXLLAMA_EMBED_PREFER_CPU", "0")
+
+    embed_on_cpu = os.environ.get("EXLLAMA_EMBED_PREFER_CPU", "1") in ("1", "true", "yes")
+
     print(f"\n{'='*60}")
     num_gpus = len(gpu_split)
     print(f"  Qwen3.5-27B-exl3 heretic - layer-split {num_gpus}-GPU server")
@@ -388,6 +424,8 @@ async def load_model():
     print(f"  Decode path  : Generator + paged flash_attn (cached)")
     print(f"  Max tokens   : {DEFAULT_MAX_TOKENS} (cap {MAX_MAX_TOKENS})")
     print(f"  Thinking     : {ENABLE_THINKING} (preserve={PRESERVE_THINK_OUTPUT}, budget={MAX_THINKING_TOKENS})")
+    print(f"  Embed device : {'CPU' if embed_on_cpu else 'GPU'} (EXLLAMA_EMBED_PREFER_CPU={os.environ.get('EXLLAMA_EMBED_PREFER_CPU','1')})")
+    print(f"  OMP threads  : {os.environ.get('OMP_NUM_THREADS', 'unset')}")
     print(f"  Endpoint     : http://{args.host}:{args.port}/v1")
     print()
 
