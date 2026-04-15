@@ -17,6 +17,7 @@ import uuid
 import torch
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any, Optional, List
@@ -42,6 +43,14 @@ logging.basicConfig(
 logger = logging.getLogger("server_mixed")
 
 app = FastAPI(title=f"ExLlamaV3 OpenAI Server - {MODEL_ID} Mixed")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 model = None
 config = None

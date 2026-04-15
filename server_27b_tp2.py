@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible TP server for Qwen3.5-27B-exl3 (6bpw heretic variant).
+OpenAI-compatible TP server for local ExLlamaV3 models.
 
-Uses real tensor-parallel (NCCL) with fp16 KV cache and the Generator pipeline
+Uses real tensor-parallel (NCCL) with paged KV cache and the Generator pipeline
 for cached, high-throughput generation.
 
 Supports TP2, TP3, or any GPU count — set CUDA_VISIBLE_DEVICES accordingly.
@@ -17,7 +17,7 @@ Usage:
       python server_27b_tp2.py --gpu-split 22.0,22.0,22.0
 
 Environment variables (override CLI defaults):
-  MODEL_DIR, GPU_SPLIT, CACHE_TOKENS, HOST, PORT, TP_BACKEND,
+  MODEL_DIR, GPU_SPLIT, CACHE_TOKENS, CACHE_QUANT, HOST, PORT, TP_BACKEND,
   DEFAULT_MAX_TOKENS (16000), MIN_MAX_TOKENS (12), MAX_MAX_TOKENS (16000)
 """
 
@@ -49,17 +49,20 @@ if _prepend:
     existing = os.environ.get("LD_LIBRARY_PATH", "")
     os.environ["LD_LIBRARY_PATH"] = _prepend + (":" + existing if existing else "")
 
+# Prevent CPU thread over-subscription next to multi-GPU workloads.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any
 import uvicorn
 
 from exllamav3 import Config, Model, Tokenizer, Cache, Generator, Job
-from exllamav3.cache import CacheLayer_fp16
+from exllamav3.cache import CacheLayer_fp16, CacheLayer_quant
 from exllamav3.generator.sampler.presets import ComboSampler, ArgmaxSampler
 from exllamav3.constants import PAGE_SIZE
 
@@ -69,10 +72,12 @@ from exllamav3.constants import PAGE_SIZE
 DEFAULT_MODEL_DIR = os.getenv(
     "MODEL_DIR", "/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3"
 )
+DEFAULT_MODEL_ID = os.getenv("MODEL_ID", os.path.basename(DEFAULT_MODEL_DIR.rstrip("/")))
 DEFAULT_GPU_SPLIT = [
     float(x) for x in os.getenv("GPU_SPLIT", "22.0,22.0").split(",")
 ]
 DEFAULT_CACHE_TOKENS = int(os.getenv("CACHE_TOKENS", "32768"))
+DEFAULT_CACHE_QUANT = os.getenv("CACHE_QUANT", "fp16")
 DEFAULT_HOST = os.getenv("HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PORT", "1234"))
 DEFAULT_TP_BACKEND = os.getenv("TP_BACKEND", "nccl")
@@ -91,12 +96,14 @@ MAX_THINKING_TOKENS = int(os.getenv("MAX_THINKING_TOKENS", "1024"))
 _model: Optional[Model] = None
 _tokenizer: Optional[Tokenizer] = None
 _generator: Optional[Generator] = None
-_model_name: str = os.getenv("MODEL_ID", os.path.basename(DEFAULT_MODEL_DIR.rstrip("/")))
+_model_name: str = DEFAULT_MODEL_ID
 _cache_tokens: int = DEFAULT_CACHE_TOKENS
+_effective_context_tokens: int = DEFAULT_CACHE_TOKENS
+_cache_quant: Optional[tuple[int, int]] = None
 _model_max_context: Optional[int] = None
 _gen_lock: asyncio.Lock
 
-app = FastAPI(title="Qwen3.5-27B heretic exl3 - TP multi-GPU server")
+app = FastAPI(title="ExLlamaV3 TP multi-GPU server")
 
 
 # ------------------------------------------------------------------
@@ -108,7 +115,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "Qwen3.5-27B-exl3-heretic-6bpw-tp2"
+    model: str = DEFAULT_MODEL_ID
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
     temperature: Optional[float] = 0.7
@@ -118,6 +125,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
+    extra_body: Optional[dict[str, Any]] = None
 
 
 # ------------------------------------------------------------------
@@ -131,6 +139,42 @@ def _normalize_max_tokens(requested: Optional[int]) -> int:
     if requested is None or requested <= 0:
         return DEFAULT_MAX_TOKENS
     return max(MIN_MAX_TOKENS, min(requested, MAX_MAX_TOKENS))
+
+
+def parse_cache_quant(spec: Optional[str]) -> Optional[tuple[int, int]]:
+    if spec is None:
+        return None
+    normalized = spec.strip().lower()
+    if normalized in ("", "none", "false", "0", "fp16"):
+        return None
+    bits = [int(part.strip()) for part in spec.split(",") if part.strip()]
+    if len(bits) == 1:
+        return bits[0], bits[0]
+    if len(bits) == 2:
+        return bits[0], bits[1]
+    raise ValueError("Specify cache quantization as 'bits' or 'k_bits,v_bits'")
+
+
+def format_cache_quant(cache_quant: Optional[tuple[int, int]]) -> str:
+    if cache_quant is None:
+        return "fp16"
+    k_bits, v_bits = cache_quant
+    if k_bits == v_bits:
+        return f"quantized {k_bits}-bit"
+    return f"quantized k={k_bits}, v={v_bits}"
+
+
+def create_cache(model: Model, cache_tokens: int, cache_quant: Optional[tuple[int, int]]) -> Cache:
+    if cache_quant is None:
+        return Cache(model, max_num_tokens=cache_tokens, layer_type=CacheLayer_fp16)
+    k_bits, v_bits = cache_quant
+    return Cache(
+        model,
+        max_num_tokens=cache_tokens,
+        layer_type=CacheLayer_quant,
+        k_bits=k_bits,
+        v_bits=v_bits,
+    )
 
 
 def _get_input_ids(encoded):
@@ -155,6 +199,30 @@ def _read_model_max_context(model_dir: str) -> Optional[int]:
     if isinstance(text_config, dict):
         return text_config.get("max_position_embeddings")
     return config_data.get("max_position_embeddings")
+
+
+def _resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, int]:
+    extra_body = request.extra_body or {}
+    extra_thinking = extra_body.get("thinking")
+
+    use_thinking = ENABLE_THINKING
+    if isinstance(extra_thinking, bool):
+        use_thinking = extra_thinking
+    elif request.enable_thinking is not None:
+        use_thinking = request.enable_thinking
+
+    if not use_thinking:
+        return False, 0
+
+    effective_budget = MAX_THINKING_TOKENS
+    if request.thinking_budget is not None:
+        effective_budget = request.thinking_budget
+    elif isinstance(extra_thinking, dict):
+        budget = extra_thinking.get("budget")
+        if isinstance(budget, int) and budget > 0:
+            effective_budget = budget
+
+    return True, effective_budget
 
 
 def format_chatml(messages: List[ChatMessage], add_assistant: bool = True) -> str:
@@ -278,6 +346,7 @@ def generate_with_thinking_budget(
     max_new: int,
     stop_conditions: set,
     max_thinking: int,
+    reasoning_collector: Optional[list[str]] = None,
 ):
     """Two-phase generation that caps the <think> block to max_thinking tokens."""
     assert _generator is not None and _tokenizer is not None
@@ -310,6 +379,8 @@ def generate_with_thinking_budget(
                     think_tokens_used = r["new_tokens"]
                 if text:
                     think_pieces.append(text)
+                    if reasoning_collector is not None:
+                        reasoning_collector.append(text)
                     if PRESERVE_THINK_OUTPUT:
                         yield text, False, think_tokens_used
                 if eos:
@@ -322,6 +393,8 @@ def generate_with_thinking_budget(
         )
         close_tag = "</think>\n"
         think_pieces.append(close_tag)
+        if reasoning_collector is not None:
+            reasoning_collector.append(close_tag)
         if PRESERVE_THINK_OUTPUT:
             yield close_tag, False, think_tokens_used
 
@@ -360,12 +433,13 @@ def generate_with_thinking_budget(
 # ------------------------------------------------------------------
 @app.on_event("startup")
 async def load_model():
-    global _model, _tokenizer, _generator, _gen_lock, _cache_tokens, _model_max_context, _model_name
+    global _model, _tokenizer, _generator, _gen_lock, _cache_tokens, _effective_context_tokens, _cache_quant, _model_max_context, _model_name
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--model", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--gpu-split", default=",".join(str(x) for x in DEFAULT_GPU_SPLIT))
     parser.add_argument("--cache-tokens", type=int, default=DEFAULT_CACHE_TOKENS)
+    parser.add_argument("--cache-quant", default=DEFAULT_CACHE_QUANT)
     parser.add_argument("--tp-backend", default=DEFAULT_TP_BACKEND)
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -373,12 +447,17 @@ async def load_model():
 
     gpu_split = [float(x) for x in args.gpu_split.split(",")]
     _cache_tokens = align_to_page(args.cache_tokens)
+    _cache_quant = parse_cache_quant(args.cache_quant)
     _model_max_context = _read_model_max_context(args.model)
+    _effective_context_tokens = (
+        min(_cache_tokens, _model_max_context)
+        if _model_max_context is not None
+        else _cache_tokens
+    )
     _model_name = os.getenv("MODEL_ID", os.path.basename(args.model.rstrip("/")))
 
     print(f"\n{'='*60}")
-    num_gpus = len(gpu_split)
-    print(f"  Qwen3.5-27B-exl3 heretic - TP {num_gpus}-GPU server (cached)")
+    print(f"  ExLlamaV3 TP {len(gpu_split)}-GPU server")
     print(f"{'='*60}")
     print(f"  Model dir    : {args.model}")
     print(f"  GPU split    : {gpu_split}")
@@ -386,7 +465,8 @@ async def load_model():
     print(f"  Cache tokens : {_cache_tokens:,}")
     if _model_max_context is not None:
         print(f"  Model limit  : {_model_max_context:,}")
-    print(f"  KV cache     : fp16 (no quantization)")
+        print(f"  Usable ctx   : {_effective_context_tokens:,}")
+    print(f"  KV cache     : {format_cache_quant(_cache_quant)}")
     print(f"  Decode path  : Generator + paged flash_attn (cached)")
     print(f"  Max tokens   : {DEFAULT_MAX_TOKENS} (cap {MAX_MAX_TOKENS})")
     print(f"  Thinking     : {ENABLE_THINKING} (preserve={PRESERVE_THINK_OUTPUT}, budget={MAX_THINKING_TOKENS})")
@@ -395,6 +475,7 @@ async def load_model():
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
     print(f"  CUDA_VISIBLE_DEVICES : {visible}")
+    print(f"  OMP threads          : {os.environ.get('OMP_NUM_THREADS', 'unset')}")
     for i in range(torch.cuda.device_count()):
         p = torch.cuda.get_device_properties(i)
         print(f"  GPU {i}: {p.name}  ({p.total_memory / 1024**3:.1f} GB)")
@@ -408,8 +489,8 @@ async def load_model():
     cfg = Config.from_directory(args.model)
     _model = Model.from_config(cfg)
 
-    print(f"Creating fp16 KV cache ({_cache_tokens:,} tokens)...")
-    cache = Cache(_model, max_num_tokens=_cache_tokens, layer_type=CacheLayer_fp16)
+    print(f"Creating {format_cache_quant(_cache_quant)} KV cache ({_cache_tokens:,} tokens)...")
+    cache = create_cache(_model, _cache_tokens, _cache_quant)
 
     print("Loading weights (tensor parallel)...")
     _model.load(
@@ -467,7 +548,7 @@ async def load_model():
         print(f"  Warmup complete in {time.time() - t0:.3f}s")
 
     _gen_lock = asyncio.Lock()
-    print(f"\nServer ready.  Cache = {_cache_tokens:,} tokens.\n")
+    print(f"\nServer ready.  Cache = {_cache_tokens:,} tokens, usable context = {_effective_context_tokens:,}.\n")
 
 
 # ------------------------------------------------------------------
@@ -479,6 +560,8 @@ async def health():
         "status": "ok",
         "model": _model_name,
         "cache_tokens": _cache_tokens,
+        "usable_context_tokens": _effective_context_tokens,
+        "cache_quant": list(_cache_quant) if _cache_quant is not None else None,
         "max_position_embeddings": _model_max_context,
         "thinking_enabled": ENABLE_THINKING,
         "preserve_think_output": PRESERVE_THINK_OUTPUT,
@@ -496,7 +579,9 @@ async def list_models():
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "local",
-                "context_length": _cache_tokens,
+                "context_length": _effective_context_tokens,
+                "cache_tokens": _cache_tokens,
+                "cache_quant": list(_cache_quant) if _cache_quant is not None else None,
                 "max_position_embeddings": _model_max_context,
             }
         ],
@@ -508,23 +593,19 @@ async def chat_completions(request: ChatCompletionRequest):
     if _model is None or _tokenizer is None or _generator is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
-    use_thinking = ENABLE_THINKING if request.enable_thinking is None else request.enable_thinking
-    effective_budget = (
-        (request.thinking_budget if request.thinking_budget is not None else MAX_THINKING_TOKENS)
-        if use_thinking else 0
-    )
+    use_thinking, effective_budget = _resolve_thinking(request)
 
     input_ids = _encode_messages(request.messages, enable_thinking=use_thinking)
 
     prompt_len = input_ids.shape[-1]
-    if prompt_len >= _cache_tokens:
+    if prompt_len >= _effective_context_tokens:
         raise HTTPException(
             status_code=400,
-            detail=f"Prompt length {prompt_len} exceeds cache size {_cache_tokens}",
+            detail=f"Prompt length {prompt_len} exceeds usable context {_effective_context_tokens}",
         )
 
     request.max_tokens = _normalize_max_tokens(request.max_tokens)
-    max_new = min(request.max_tokens, _cache_tokens - prompt_len - 1)
+    max_new = min(request.max_tokens, _effective_context_tokens - prompt_len - 1)
 
     eos_token_id = _tokenizer.eos_token_id
     im_end_id = _tokenizer.single_id("<|im_end|>")
@@ -534,10 +615,17 @@ async def chat_completions(request: ChatCompletionRequest):
     created = int(time.time())
     think_prefix = _thinking_output_prefix(use_thinking)
 
+    reasoning_chunks: list[str] = []
+
     def _gen():
         if use_thinking and effective_budget > 0:
             return generate_with_thinking_budget(
-                input_ids, request, max_new, stop_conditions, effective_budget
+                input_ids,
+                request,
+                max_new,
+                stop_conditions,
+                effective_budget,
+                reasoning_collector=reasoning_chunks,
             )
         return generate_with_generator(input_ids, request, max_new, stop_conditions)
 
@@ -586,6 +674,11 @@ async def chat_completions(request: ChatCompletionRequest):
         if not PRESERVE_THINK_OUTPUT:
             response_text = _strip_thinking(response_text)
 
+    response_message = {"role": "assistant", "content": response_text}
+    reasoning_text = "".join(reasoning_chunks).strip()
+    if reasoning_text:
+        response_message["reasoning"] = reasoning_text
+
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -594,7 +687,7 @@ async def chat_completions(request: ChatCompletionRequest):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": response_text},
+                "message": response_message,
                 "finish_reason": "stop",
             }
         ],
@@ -610,12 +703,13 @@ async def chat_completions(request: ChatCompletionRequest):
 # Entry point
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Qwen3.5-27B-exl3 heretic TP N-GPU server")
+    parser = argparse.ArgumentParser(description="ExLlamaV3 TP N-GPU server")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--model", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--gpu-split", default=",".join(str(x) for x in DEFAULT_GPU_SPLIT))
     parser.add_argument("--cache-tokens", type=int, default=DEFAULT_CACHE_TOKENS)
+    parser.add_argument("--cache-quant", default=DEFAULT_CACHE_QUANT)
     parser.add_argument("--tp-backend", default=DEFAULT_TP_BACKEND)
     args = parser.parse_args()
 

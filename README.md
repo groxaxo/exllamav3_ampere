@@ -275,13 +275,11 @@ python /home/op/exllamav3_ampere/server_27b_layer.py \
 
 ### Qwen3.5-27B on dual RTX 3090s
 
-**TP2 (NCCL) is now the production path.** The previous NCCL failures were
-caused by `nvidia-nccl-cu13` (NCCL 2.28.9+cuda13.0) silently overwriting the
-correct `nvidia-nccl-cu12` (2.27.5, CUDA 12.8).  After fixing the package and
-the `LD_LIBRARY_PATH` order, NCCL initialises cleanly on GPUs 0,1.
-
-**Measured performance**: ~28.5 t/s sustained decode (vs ~25 t/s layer-split,
-**+14%**). Peak 29.5 t/s achieved in prior sessions.
+**Historical note:** a previous clean NCCL run made TP2 look best on this host
+after `nvidia-nccl-cu13` (NCCL 2.28.9+cuda13.0) was removed and the
+`LD_LIBRARY_PATH` order was fixed so CUDA 12.8 / NCCL 2.27.5 loaded correctly.
+Keep the numbers below as a useful reference point, but do not treat them as
+the default recommendation without re-running the current host state.
 
 On the lighter `bench_tp.py` microbenchmark (74-token prompt, 4K cache, 200
 generated tokens), the current TP2 hot path now reaches **30.3 t/s decode** on
@@ -298,11 +296,31 @@ That same microbenchmark reports:
 - **2×3090 TP2 baseline**: `24.1 t/s` decode, `105.6 t/s` prefill
 - **2×3090 TP2 tuned**: `30.3 t/s` decode, `118.2 t/s` prefill
 
-So TP2 is now decisively better for decode-heavy workloads, while very short
-prompt prefill still favors the single-GPU path because communication overhead
-dominates before the prompt is large enough to amortize it.
+Fresh rerun on this exact host on 2026-03-27 using the repo's current
+`bench_tp.py` harness (`CACHE_TOKENS=32768`, `MAX_NEW_TOKENS=500`, `2` runs,
+`OMP_NUM_THREADS=1`, RTX 3090s only, no `NCCL_ALGO` override) produced:
 
-Launch with:
+- **1x3090 TP1**: `19.18 t/s` decode, `210.44 t/s` prefill
+- **2x3090 TP2**: `13.88 t/s` decode, `140.28 t/s` prefill
+- **3x3090 TP3**: `12.39 t/s` decode, `92.75 t/s` prefill
+- **2x3090 layer-split**: `20.18 t/s` decode, `201.81 t/s` prefill
+- **3x3090 layer-split**: `20.00 t/s` decode, `198.25 t/s` prefill
+
+So the current recommendation on this machine is:
+
+- **Interactive / decode-heavy 27B serving:** prefer `server_27b_layer.py`
+  with the new wrapper `run_qwen27b_3090_layersplit.sh`
+- **Single-stream simplicity:** `1x3090` remains competitive
+- **TP2 / TP3:** keep for experimentation or TP-specific capacity work, not for
+  best decode speed on the current PCIe-only 3090 setup
+
+Fastest measured 3090 launch on the current host:
+
+```bash
+bash /home/op/exllamav3_ampere/run_qwen27b_3090_layersplit.sh
+```
+
+Older TP2/NCCL experiment path:
 
 ```bash
 bash /home/op/exllamav3_ampere/launch_27b_gpu01.sh
@@ -343,7 +361,8 @@ or other GPU layouts:
   server in this repo
 
 For new production launches, prefer wrapper scripts over direct use of the older
-one-off server entry points.
+one-off server entry points. For the current 3090 host, start with
+`run_qwen27b_3090_layersplit.sh`.
 
 ## Deployment patterns worth reusing
 

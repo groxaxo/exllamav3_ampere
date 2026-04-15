@@ -18,7 +18,10 @@ Usage:
 
 Environment variables (override CLI defaults):
   MODEL_DIR, GPU_SPLIT, CACHE_TOKENS, HOST, PORT,
-  DEFAULT_MAX_TOKENS (16000), MIN_MAX_TOKENS (12), MAX_MAX_TOKENS (16000)
+  DEFAULT_MAX_TOKENS (16000), MIN_MAX_TOKENS (12), MAX_MAX_TOKENS (16000),
+  DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_TOP_K, DEFAULT_MIN_P,
+  DEFAULT_REPETITION_PENALTY, DEFAULT_PRESENCE_PENALTY,
+  DEFAULT_FREQUENCY_PENALTY, DEFAULT_PENALTY_RANGE
 """
 
 import sys
@@ -41,6 +44,23 @@ if os.path.exists(torch_lib):
 
 # Prevent CPU thread over-subscription next to GPU workloads.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+# Ampere fast-path: use native ext kernel for GDN recurrent state, keep all
+# tensors GPU-resident, disable host-side recurrent cache, lazy CUDA module
+# loading, and optimised CUDA memory allocator settings.
+os.environ.setdefault("EXLLAMA_GDN_RECURRENT_BACKEND", "ext")
+os.environ.setdefault("EXLLAMA_STRICT_GPU_ONLY", "1")
+os.environ.setdefault("EXLLAMA_DISABLE_HOST_RECURRENT_CACHE", "1")
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.80",
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,11 +68,11 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Union
 import uvicorn
 
 from exllamav3 import Config, Model, Tokenizer, Cache, Generator, Job
-from exllamav3.cache import CacheLayer_fp16
+from exllamav3.cache import CacheLayer_fp16, CacheLayer_quant
 from exllamav3.generator.sampler.presets import ComboSampler, ArgmaxSampler
 from exllamav3.constants import PAGE_SIZE
 
@@ -62,22 +82,39 @@ from exllamav3.constants import PAGE_SIZE
 DEFAULT_MODEL_DIR = os.getenv(
     "MODEL_DIR", "/home/op/exllamav3_ampere/models/Qwen3.5-27B-exl3"
 )
-DEFAULT_GPU_SPLIT = [
-    float(x) for x in os.getenv("GPU_SPLIT", "22.0,22.0").split(",")
-]
+DEFAULT_GPU_SPLIT = [float(x) for x in os.getenv("GPU_SPLIT", "22.0,22.0").split(",")]
 DEFAULT_CACHE_TOKENS = int(os.getenv("CACHE_TOKENS", "32768"))
+DEFAULT_CACHE_QUANT = os.getenv("CACHE_QUANT")
 DEFAULT_HOST = os.getenv("HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PORT", "1234"))
-DEFAULT_TP_BACKEND = os.getenv("TP_BACKEND", "nccl")  # unused in layer-split, kept for compat
+DEFAULT_TP_BACKEND = os.getenv(
+    "TP_BACKEND", "nccl"
+)  # unused in layer-split, kept for compat
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "16000"))
 MIN_MAX_TOKENS = int(os.getenv("MIN_MAX_TOKENS", "12"))
 MAX_MAX_TOKENS = int(os.getenv("MAX_MAX_TOKENS", "16000"))
 ENABLE_THINKING = os.getenv("ENABLE_THINKING", "true").lower() in ("1", "true", "yes")
-PRESERVE_THINK_OUTPUT = os.getenv("PRESERVE_THINK_OUTPUT", "true").lower() in ("1", "true", "yes")
-ENABLE_STARTUP_WARMUP = os.getenv("EXLLAMA_STARTUP_WARMUP", "1").lower() in ("1", "true", "yes")
+PRESERVE_THINK_OUTPUT = os.getenv("PRESERVE_THINK_OUTPUT", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+ENABLE_STARTUP_WARMUP = os.getenv("EXLLAMA_STARTUP_WARMUP", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # Cap on tokens spent inside the <think> block before forcing </think> and moving to the response.
 # Prevents the model from "overthinking" and using the entire token budget on reasoning.
 MAX_THINKING_TOKENS = int(os.getenv("MAX_THINKING_TOKENS", "1024"))
+DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.7"))
+DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.9"))
+DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "0"))
+DEFAULT_MIN_P = float(os.getenv("DEFAULT_MIN_P", "0.08"))
+DEFAULT_REPETITION_PENALTY = float(os.getenv("DEFAULT_REPETITION_PENALTY", "1.0"))
+DEFAULT_PRESENCE_PENALTY = float(os.getenv("DEFAULT_PRESENCE_PENALTY", "0.0"))
+DEFAULT_FREQUENCY_PENALTY = float(os.getenv("DEFAULT_FREQUENCY_PENALTY", "0.0"))
+DEFAULT_PENALTY_RANGE = int(os.getenv("DEFAULT_PENALTY_RANGE", "1024"))
 
 # ------------------------------------------------------------------
 # Globals (populated during startup)
@@ -85,8 +122,11 @@ MAX_THINKING_TOKENS = int(os.getenv("MAX_THINKING_TOKENS", "1024"))
 _model: Optional[Model] = None
 _tokenizer: Optional[Tokenizer] = None
 _generator: Optional[Generator] = None
-_model_name: str = os.getenv("MODEL_ID", os.path.basename(DEFAULT_MODEL_DIR.rstrip("/")))
+_model_name: str = os.getenv(
+    "MODEL_ID", os.path.basename(DEFAULT_MODEL_DIR.rstrip("/"))
+)
 _cache_tokens: int = DEFAULT_CACHE_TOKENS
+_cache_quant: Optional[tuple[int, int]] = None
 _model_max_context: Optional[int] = None
 _gen_lock: asyncio.Lock
 
@@ -98,17 +138,23 @@ app = FastAPI(title="Qwen3.5-27B heretic exl3 - layer-split multi-GPU server")
 # ------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Union[
+        str, List[dict]
+    ]  # Accept both "text" and [{"type": "text", "text": "..."}] formats
 
 
 class ChatCompletionRequest(BaseModel):
     model: str = "Qwen3.5-27B-exl3-heretic-6bpw-tp2"
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
-    min_p: Optional[float] = 0.08
-    top_k: Optional[int] = 0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    min_p: Optional[float] = None
+    top_k: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    penalty_range: Optional[int] = None
     stream: Optional[bool] = False
     # Per-request thinking controls (None = use server defaults)
     enable_thinking: Optional[bool] = None
@@ -120,6 +166,44 @@ class ChatCompletionRequest(BaseModel):
 # ------------------------------------------------------------------
 def align_to_page(n: int) -> int:
     return (n // PAGE_SIZE) * PAGE_SIZE
+
+
+def _parse_cache_quant(spec: Optional[str]) -> Optional[tuple[int, int]]:
+    if spec is None:
+        return None
+    normalized = spec.strip().lower()
+    if normalized in ("", "none", "false", "0", "fp16"):
+        return None
+    split = [int(bits.strip()) for bits in spec.split(",") if bits.strip()]
+    if len(split) == 1:
+        return split[0], split[0]
+    if len(split) == 2:
+        return split[0], split[1]
+    raise ValueError("Specify cache quantization as 'bits' or 'k_bits,v_bits'")
+
+
+def _format_cache_quant(cache_quant: Optional[tuple[int, int]]) -> str:
+    if cache_quant is None:
+        return "fp16"
+    k_bits, v_bits = cache_quant
+    if k_bits == v_bits:
+        return f"quantized {k_bits}-bit"
+    return f"quantized k={k_bits}, v={v_bits}"
+
+
+def _create_cache(
+    model: Model, cache_tokens: int, cache_quant: Optional[tuple[int, int]]
+) -> Cache:
+    if cache_quant is None:
+        return Cache(model, max_num_tokens=cache_tokens, layer_type=CacheLayer_fp16)
+    k_bits, v_bits = cache_quant
+    return Cache(
+        model,
+        max_num_tokens=cache_tokens,
+        layer_type=CacheLayer_quant,
+        k_bits=k_bits,
+        v_bits=v_bits,
+    )
 
 
 def _normalize_max_tokens(requested: Optional[int]) -> int:
@@ -156,42 +240,68 @@ def format_chatml(messages: List[ChatMessage], add_assistant: bool = True) -> st
     prompt = ""
     for msg in messages:
         role = msg.role.strip().lower()
+        content = _extract_content(msg.content)
         if role == "system":
-            prompt += f"<|im_start|>system\n{msg.content}<|im_end|>\n"
+            prompt += f"<|im_start|>system\n{content}<|im_end|>\n"
         elif role == "user":
-            prompt += f"<|im_start|>user\n{msg.content}<|im_end|>\n"
+            prompt += f"<|im_start|>user\n{content}<|im_end|>\n"
         elif role == "assistant":
-            prompt += f"<|im_start|>assistant\n{msg.content}<|im_end|>\n"
+            prompt += f"<|im_start|>assistant\n{content}<|im_end|>\n"
     if add_assistant:
         prompt += "<|im_start|>assistant\n"
     return prompt
 
 
-def _encode_messages(messages: List[ChatMessage], enable_thinking: Optional[bool] = None):
+def _extract_content(content: Union[str, List[dict]]) -> str:
+    """Extract text from either string or array content format."""
+    if isinstance(content, str):
+        return content
+    # Array format: [{"type": "text", "text": "..."}]
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        return " ".join(text_parts)
+    return str(content)
+
+
+def _encode_messages(
+    messages: List[ChatMessage], enable_thinking: Optional[bool] = None
+):
     assert _tokenizer is not None
     effective_thinking = ENABLE_THINKING if enable_thinking is None else enable_thinking
-    hf_messages = [{"role": m.role, "content": m.content} for m in messages]
-    if hasattr(_tokenizer, "hf_render_chat_template"):
-        rendered = _tokenizer.hf_render_chat_template(
-            hf_messages,
-            add_generation_prompt=True,
-            enable_thinking=effective_thinking,
-        )
-        return _get_input_ids(
-            _tokenizer.encode(
-                rendered,
-                add_bos=_should_add_bos(),
-                encode_special_tokens=True,
-            )
-        )
-    if hasattr(_tokenizer, "hf_chat_template"):
-        return _get_input_ids(
-            _tokenizer.hf_chat_template(
+    hf_messages = [
+        {"role": m.role, "content": _extract_content(m.content)} for m in messages
+    ]
+
+    # Try HF chat template first, fall back to ChatML if it fails
+    try:
+        if hasattr(_tokenizer, "hf_render_chat_template"):
+            rendered = _tokenizer.hf_render_chat_template(
                 hf_messages,
                 add_generation_prompt=True,
                 enable_thinking=effective_thinking,
             )
-        )
+            return _get_input_ids(
+                _tokenizer.encode(
+                    rendered,
+                    add_bos=_should_add_bos(),
+                    encode_special_tokens=True,
+                )
+            )
+        if hasattr(_tokenizer, "hf_chat_template"):
+            return _get_input_ids(
+                _tokenizer.hf_chat_template(
+                    hf_messages,
+                    add_generation_prompt=True,
+                    enable_thinking=effective_thinking,
+                )
+            )
+    except Exception as e:
+        # Fall back to ChatML format if HF template fails
+        print(f"HF chat template failed: {e}, falling back to ChatML")
+
     prompt = format_chatml(messages)
     return _get_input_ids(
         _tokenizer.encode(
@@ -211,32 +321,53 @@ def _strip_thinking(text: str) -> str:
         if end == -1:
             text = text[:start].strip()
             break
-        text = (text[:start] + text[end + len("</think>"):]).strip()
+        text = (text[:start] + text[end + len("</think>") :]).strip()
     return text
 
 
 def make_sampler(request: ChatCompletionRequest):
-    from exllamav3.generator.sampler.custom import SS_Temperature, SS_TopK, SS_TopP, SS_MinP, SS_Sample, SS_Argmax
-    temp = request.temperature if request.temperature is not None else 0.7
+    temp = DEFAULT_TEMPERATURE if request.temperature is None else request.temperature
     if temp <= 0:
         return ArgmaxSampler()
-    steps = []
-    min_p = request.min_p or 0.0
-    if min_p > 0:
-        steps.append(SS_MinP(min_p))
-    top_k = request.top_k or 0
-    if top_k > 0:
-        steps.append(SS_TopK(top_k))
-    top_p = request.top_p if request.top_p is not None else 1.0
-    if 0 < top_p < 1.0:
-        steps.append(SS_TopP(top_p))
-    steps.append(SS_Temperature(temp))
-    steps.append(SS_Sample())
-    from exllamav3.generator.sampler.custom import CustomSampler
-    return CustomSampler(steps)
+    return ComboSampler(
+        rep_p=(
+            DEFAULT_REPETITION_PENALTY
+            if request.repetition_penalty is None
+            else request.repetition_penalty
+        ),
+        pres_p=(
+            DEFAULT_PRESENCE_PENALTY
+            if request.presence_penalty is None
+            else request.presence_penalty
+        ),
+        freq_p=(
+            DEFAULT_FREQUENCY_PENALTY
+            if request.frequency_penalty is None
+            else request.frequency_penalty
+        ),
+        rep_sustain_range=(
+            DEFAULT_PENALTY_RANGE
+            if request.penalty_range is None
+            else request.penalty_range
+        ),
+        rep_decay_range=(
+            DEFAULT_PENALTY_RANGE
+            if request.penalty_range is None
+            else request.penalty_range
+        ),
+        temperature=temp,
+        min_p=DEFAULT_MIN_P if request.min_p is None else request.min_p,
+        top_k=DEFAULT_TOP_K if request.top_k is None else request.top_k,
+        top_p=DEFAULT_TOP_P if request.top_p is None else request.top_p,
+    )
 
 
-def generate_with_generator(input_ids: torch.Tensor, request: ChatCompletionRequest, max_new: int, stop_conditions: set):
+def generate_with_generator(
+    input_ids: torch.Tensor,
+    request: ChatCompletionRequest,
+    max_new: int,
+    stop_conditions: set,
+):
     """Generate tokens using the cached Generator pipeline."""
     sampler = make_sampler(request)
     job = Job(
@@ -333,9 +464,13 @@ def generate_with_thinking_budget(
         if PRESERVE_THINK_OUTPUT:
             yield close_tag, False, think_tokens_used
         # Encode only the short injected tag to append to the token stream.
-        injected_close_ids = _get_input_ids(
-            _tokenizer.encode(close_tag, add_bos=False, encode_special_tokens=True)
-        ).cpu().view(-1)
+        injected_close_ids = (
+            _get_input_ids(
+                _tokenizer.encode(close_tag, add_bos=False, encode_special_tokens=True)
+            )
+            .cpu()
+            .view(-1)
+        )
 
     # ------------------------------------------------------------------ Phase 2
     # Build phase-2 input from actual token IDs (no lossy text→token roundtrip).
@@ -386,12 +521,23 @@ def generate_with_thinking_budget(
 # ------------------------------------------------------------------
 @app.on_event("startup")
 async def load_model():
-    global _model, _tokenizer, _generator, _gen_lock, _cache_tokens, _model_max_context, _model_name
+    global \
+        _model, \
+        _tokenizer, \
+        _generator, \
+        _gen_lock, \
+        _cache_tokens, \
+        _cache_quant, \
+        _model_max_context, \
+        _model_name
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--model", default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--gpu-split", default=",".join(str(x) for x in DEFAULT_GPU_SPLIT))
+    parser.add_argument(
+        "--gpu-split", default=",".join(str(x) for x in DEFAULT_GPU_SPLIT)
+    )
     parser.add_argument("--cache-tokens", type=int, default=DEFAULT_CACHE_TOKENS)
+    parser.add_argument("--cache-quant", default=DEFAULT_CACHE_QUANT)
     parser.add_argument("--tp-backend", default=DEFAULT_TP_BACKEND)
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -399,6 +545,7 @@ async def load_model():
 
     gpu_split = [float(x) for x in args.gpu_split.split(",")]
     _cache_tokens = align_to_page(args.cache_tokens)
+    _cache_quant = _parse_cache_quant(args.cache_quant)
     _model_max_context = _read_model_max_context(args.model)
     _model_name = os.getenv("MODEL_ID", os.path.basename(args.model.rstrip("/")))
 
@@ -408,23 +555,37 @@ async def load_model():
     if len(gpu_split) > 1:
         os.environ.setdefault("EXLLAMA_EMBED_PREFER_CPU", "0")
 
-    embed_on_cpu = os.environ.get("EXLLAMA_EMBED_PREFER_CPU", "1") in ("1", "true", "yes")
+    embed_on_cpu = os.environ.get("EXLLAMA_EMBED_PREFER_CPU", "1") in (
+        "1",
+        "true",
+        "yes",
+    )
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     num_gpus = len(gpu_split)
     print(f"  Qwen3.5-27B-exl3 heretic - layer-split {num_gpus}-GPU server")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Model dir    : {args.model}")
     print(f"  GPU split    : {gpu_split}")
     print(f"  Mode         : layer-split (pipeline, no TP comms)")
     print(f"  Cache tokens : {_cache_tokens:,}")
     if _model_max_context is not None:
         print(f"  Model limit  : {_model_max_context:,}")
-    print(f"  KV cache     : fp16 (no quantization)")
+    print(f"  KV cache     : {_format_cache_quant(_cache_quant)}")
     print(f"  Decode path  : Generator + paged flash_attn (cached)")
     print(f"  Max tokens   : {DEFAULT_MAX_TOKENS} (cap {MAX_MAX_TOKENS})")
-    print(f"  Thinking     : {ENABLE_THINKING} (preserve={PRESERVE_THINK_OUTPUT}, budget={MAX_THINKING_TOKENS})")
-    print(f"  Embed device : {'CPU' if embed_on_cpu else 'GPU'} (EXLLAMA_EMBED_PREFER_CPU={os.environ.get('EXLLAMA_EMBED_PREFER_CPU','1')})")
+    print(
+        f"  Sampling     : temp={DEFAULT_TEMPERATURE}, top_p={DEFAULT_TOP_P}, top_k={DEFAULT_TOP_K}, min_p={DEFAULT_MIN_P}"
+    )
+    print(
+        f"  Penalties    : presence={DEFAULT_PRESENCE_PENALTY}, repetition={DEFAULT_REPETITION_PENALTY}, frequency={DEFAULT_FREQUENCY_PENALTY}, range={DEFAULT_PENALTY_RANGE}"
+    )
+    print(
+        f"  Thinking     : {ENABLE_THINKING} (preserve={PRESERVE_THINK_OUTPUT}, budget={MAX_THINKING_TOKENS})"
+    )
+    print(
+        f"  Embed device : {'CPU' if embed_on_cpu else 'GPU'} (EXLLAMA_EMBED_PREFER_CPU={os.environ.get('EXLLAMA_EMBED_PREFER_CPU', '1')})"
+    )
     print(f"  OMP threads  : {os.environ.get('OMP_NUM_THREADS', 'unset')}")
     print(f"  Endpoint     : http://{args.host}:{args.port}/v1")
     print()
@@ -444,8 +605,10 @@ async def load_model():
     cfg = Config.from_directory(args.model)
     _model = Model.from_config(cfg)
 
-    print(f"Creating fp16 KV cache ({_cache_tokens:,} tokens)...")
-    cache = Cache(_model, max_num_tokens=_cache_tokens, layer_type=CacheLayer_fp16)
+    print(
+        f"Creating {_format_cache_quant(_cache_quant)} KV cache ({_cache_tokens:,} tokens)..."
+    )
+    cache = _create_cache(_model, _cache_tokens, _cache_quant)
 
     print("Loading weights (layer-split across GPUs)...")
     _model.load(
@@ -510,10 +673,21 @@ async def health():
         "status": "ok",
         "model": _model_name,
         "cache_tokens": _cache_tokens,
+        "cache_quant": list(_cache_quant) if _cache_quant is not None else None,
         "max_position_embeddings": _model_max_context,
         "thinking_enabled": ENABLE_THINKING,
         "preserve_think_output": PRESERVE_THINK_OUTPUT,
         "max_thinking_tokens": MAX_THINKING_TOKENS,
+        "default_sampling": {
+            "temperature": DEFAULT_TEMPERATURE,
+            "top_p": DEFAULT_TOP_P,
+            "top_k": DEFAULT_TOP_K,
+            "min_p": DEFAULT_MIN_P,
+            "presence_penalty": DEFAULT_PRESENCE_PENALTY,
+            "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+            "frequency_penalty": DEFAULT_FREQUENCY_PENALTY,
+            "penalty_range": DEFAULT_PENALTY_RANGE,
+        },
     }
 
 
@@ -540,10 +714,17 @@ async def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
     # Resolve per-request thinking flag (None → use server default)
-    use_thinking = ENABLE_THINKING if request.enable_thinking is None else request.enable_thinking
+    use_thinking = (
+        ENABLE_THINKING if request.enable_thinking is None else request.enable_thinking
+    )
     effective_budget = (
-        (request.thinking_budget if request.thinking_budget is not None else MAX_THINKING_TOKENS)
-        if use_thinking else 0
+        (
+            request.thinking_budget
+            if request.thinking_budget is not None
+            else MAX_THINKING_TOKENS
+        )
+        if use_thinking
+        else 0
     )
 
     input_ids = _encode_messages(request.messages, enable_thinking=use_thinking)
@@ -566,14 +747,23 @@ async def chat_completions(request: ChatCompletionRequest):
     created = int(time.time())
 
     # Choose generator: two-phase with thinking budget, or plain single-phase.
+    # NOTE: the chat template bakes `<think>\n` into the generation prompt prefix
+    # (it is part of input_ids, not generated by the model).  We must emit it
+    # ourselves as the very first chunk so clients see the complete think block.
     def _gen():
+        if use_thinking and PRESERVE_THINK_OUTPUT:
+            yield "<think>\n", False, 0
         if use_thinking and effective_budget > 0:
-            return generate_with_thinking_budget(
+            yield from generate_with_thinking_budget(
                 input_ids, request, max_new, stop_conditions, effective_budget
             )
-        return generate_with_generator(input_ids, request, max_new, stop_conditions)
+        else:
+            yield from generate_with_generator(
+                input_ids, request, max_new, stop_conditions
+            )
 
     if request.stream:
+
         async def generate_stream():
             async with _gen_lock:
                 for chunk, eos, _ntok in _gen():
@@ -583,7 +773,13 @@ async def chat_completions(request: ChatCompletionRequest):
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": _model_name,
-                            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk},
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
                         yield f"data: {json.dumps(data)}\n\n"
                         await asyncio.sleep(0)
@@ -633,12 +829,17 @@ async def chat_completions(request: ChatCompletionRequest):
 # Entry point
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Qwen3.5-27B-exl3 heretic TP N-GPU server")
+    parser = argparse.ArgumentParser(
+        description="Qwen3.5-27B-exl3 heretic TP N-GPU server"
+    )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--model", default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--gpu-split", default=",".join(str(x) for x in DEFAULT_GPU_SPLIT))
+    parser.add_argument(
+        "--gpu-split", default=",".join(str(x) for x in DEFAULT_GPU_SPLIT)
+    )
     parser.add_argument("--cache-tokens", type=int, default=DEFAULT_CACHE_TOKENS)
+    parser.add_argument("--cache-quant", default=DEFAULT_CACHE_QUANT)
     parser.add_argument("--tp-backend", default=DEFAULT_TP_BACKEND)
     args = parser.parse_args()
 

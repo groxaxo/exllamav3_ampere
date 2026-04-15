@@ -201,6 +201,7 @@ class Attention(Module):
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
+        v_norm_eps: float | None = None,
         q_proj: Linear | Module | None = None,
         k_proj: Linear | Module | None = None,
         v_proj: Linear | Module | None = None,
@@ -302,6 +303,7 @@ class Attention(Module):
             self.k_norm = None
             self.norm_eps = 1e-6
             self.norm_constant_bias = 0.0
+        self.v_norm_eps = v_norm_eps
 
         # Register headwise gate
         if key_g:
@@ -549,6 +551,14 @@ class Attention(Module):
         return q, k
 
 
+    def apply_v_norm(self, v: torch.Tensor) -> torch.Tensor:
+        if self.v_norm_eps is None:
+            return v
+        v_float = v.float()
+        mean_squared = v_float.pow(2).mean(-1, keepdim = True) + self.v_norm_eps
+        return (v_float * torch.pow(mean_squared, -0.5)).to(v.dtype)
+
+
     def decode_sdpa_nc(
         self,
         x: torch.Tensor,
@@ -567,8 +577,6 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        assert self.sliding_window < 0, \
-            "Torch SDPA does not support sliding window attention (SWA)"
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
@@ -595,14 +603,37 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
+        v = self.apply_v_norm(v)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
+        if self.sliding_window >= 0:
+            key_idx = torch.arange(seqlen, device = q.device)
+            query_idx = torch.arange(seqlen, device = q.device).unsqueeze(-1)
+            min_key = torch.clamp(query_idx - self.sliding_window + 1, min = 0)
+            attn_mask = (key_idx <= query_idx) & (key_idx >= min_key)
+            o = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask = attn_mask,
+                is_causal = False,
+                enable_gqa = self.gqa,
+                scale = self.sm_scale,
+            )
+        else:
+            o = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal = causal,
+                enable_gqa = self.gqa,
+                scale = self.sm_scale,
+            )
         o = o.transpose(1, 2)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -650,6 +681,7 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
+        v = self.apply_v_norm(v)
         _assert_flash_attn()
         flash_kwargs = _flash_attn_extra_kwargs(
             (self.sliding_window, self.sliding_window),
@@ -681,7 +713,7 @@ class Attention(Module):
             )
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -733,6 +765,7 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
+        v = self.apply_v_norm(v)
         if self.has_split_cache:
             cache_layer = self.tp_cache_lookup[cache]
         else:
@@ -771,11 +804,13 @@ class Attention(Module):
             cache_layer.update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
@@ -854,6 +889,7 @@ class Attention(Module):
                 "use_cu_seqlens": self.use_cu_seqlens,
                 "post_rope_norm": self.post_rope_norm,
                 "tp_split_norm": self.tp_split_norm,
+                "v_norm_eps": self.v_norm_eps,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (

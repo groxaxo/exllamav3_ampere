@@ -29,6 +29,9 @@ if lib_paths:
     prepend = ":".join(lib_paths)
     os.environ["LD_LIBRARY_PATH"] = prepend + (":" + current_ld if current_ld else "")
 
+# Prevent CPU thread over-subscription next to multi-GPU workloads.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -38,7 +41,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from exllamav3 import Config, Model, Tokenizer, Cache, Generator, Job
-from exllamav3.cache import CacheLayer_fp16
+from exllamav3.cache import CacheLayer_fp16, CacheLayer_quant
 from exllamav3.generator.sampler.presets import ArgmaxSampler
 from exllamav3.constants import PAGE_SIZE
 
@@ -60,9 +63,46 @@ def align_to_page(n: int) -> int:
     return (n // PAGE_SIZE) * PAGE_SIZE
 
 
+def parse_cache_quant(spec: str | None) -> tuple[int, int] | None:
+    if spec is None:
+        return None
+    normalized = spec.strip().lower()
+    if normalized in ("", "none", "false", "0", "fp16"):
+        return None
+    split = [int(bits.strip()) for bits in spec.split(",") if bits.strip()]
+    if len(split) == 1:
+        return split[0], split[0]
+    if len(split) == 2:
+        return split[0], split[1]
+    raise ValueError("Specify cache quantization as 'bits' or 'k_bits,v_bits'")
+
+
+def format_cache_quant(cache_quant: tuple[int, int] | None) -> str:
+    if cache_quant is None:
+        return "fp16"
+    k_bits, v_bits = cache_quant
+    if k_bits == v_bits:
+        return f"quantized {k_bits}-bit"
+    return f"quantized k={k_bits}, v={v_bits}"
+
+
+def create_cache(model: Model, cache_tokens: int, cache_quant: tuple[int, int] | None) -> Cache:
+    if cache_quant is None:
+        return Cache(model, max_num_tokens=cache_tokens, layer_type=CacheLayer_fp16)
+    k_bits, v_bits = cache_quant
+    return Cache(
+        model,
+        max_num_tokens=cache_tokens,
+        layer_type=CacheLayer_quant,
+        k_bits=k_bits,
+        v_bits=v_bits,
+    )
+
+
 def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
                   max_new_tokens: int, num_runs: int, tp_backend: str,
-                  layer_split: bool = False, model_dir: str = DEFAULT_MODEL_DIR):
+                  layer_split: bool = False, model_dir: str = DEFAULT_MODEL_DIR,
+                  cache_quant: tuple[int, int] | None = None):
     print(f"\n{'='*70}")
     if layer_split:
         mode_label = f"layer-split-{tp_size}GPU"
@@ -79,9 +119,11 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
     print(f"  GPU split    : {gpu_split}")
     print(f"  Mode         : {'layer-split (pipeline)' if layer_split else ('tensor-parallel' if tp_size > 1 else 'single-GPU')}")
     print(f"  Cache tokens : {cache_tokens:,}")
+    print(f"  KV cache     : {format_cache_quant(cache_quant)}")
     print(f"  Max new tok  : {max_new_tokens}")
     print(f"  TP backend   : {tp_backend if not layer_split else 'n/a (layer-split)'}")
     print(f"  Runs         : {num_runs}")
+    print(f"  OMP threads  : {os.environ.get('OMP_NUM_THREADS', 'unset')}")
 
     num_visible = torch.cuda.device_count()
     print(f"\n  Visible GPUs : {num_visible}")
@@ -104,8 +146,8 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
     cfg = Config.from_directory(model_dir)
     model = Model.from_config(cfg)
 
-    print(f"Creating fp16 KV cache ({cache_tokens:,} tokens)...")
-    cache = Cache(model, max_num_tokens=cache_tokens, layer_type=CacheLayer_fp16)
+    print(f"Creating {format_cache_quant(cache_quant)} KV cache ({cache_tokens:,} tokens)...")
+    cache = create_cache(model, cache_tokens, cache_quant)
 
     use_tensor_parallel = tp_size > 1 and not layer_split
     load_mode_str = "layer-split" if layer_split else ("tensor parallel" if use_tensor_parallel else "single GPU")
@@ -223,6 +265,7 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
         "gpu_names": gpu_names[:tp_size],
         "layer_split": layer_split,
         "cache_tokens": cache_tokens,
+        "cache_quant": list(cache_quant) if cache_quant is not None else None,
         "max_new_tokens": max_new_tokens,
         "tp_backend": tp_backend if not layer_split else "n/a",
         "nccl_algo": os.environ.get("NCCL_ALGO") if use_tensor_parallel and tp_backend == "nccl" else None,
@@ -242,11 +285,13 @@ def run_benchmark(tp_size: int, gpu_split: list[float], cache_tokens: int,
 
 def main():
     parser = argparse.ArgumentParser(description="Decode benchmark for Qwen3.5-27B-exl3")
-    parser.add_argument("--tp", type=int, default=1, choices=[1, 2, 3],
-                        help="GPU count: 1 for single-GPU, 2/3 for tensor-parallel or layer-split")
+    parser.add_argument("--tp", type=int, default=1, choices=[1, 2, 3, 4, 5],
+                        help="GPU count: 1-5 visible GPUs for tensor-parallel or layer-split")
     parser.add_argument("--mode", default="tp", choices=["tp", "layer_split"],
                         help="Inference mode: 'tp' for tensor-parallel (default) or 'layer_split' for pipeline")
     parser.add_argument("--cache-tokens", type=int, default=32768)
+    parser.add_argument("--cache-quant", default=None,
+                        help="KV cache quantization: '4' or 'k_bits,v_bits'. Default: fp16")
     parser.add_argument("--max-new-tokens", type=int, default=500)
     parser.add_argument("--num-runs", type=int, default=3)
     parser.add_argument("--tp-backend", default="nccl")
@@ -274,6 +319,7 @@ def main():
         tp_backend=args.tp_backend,
         layer_split=layer_split,
         model_dir=args.model,
+        cache_quant=parse_cache_quant(args.cache_quant),
     )
 
     ts = time.strftime("%Y%m%dT%H%M%S")

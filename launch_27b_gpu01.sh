@@ -68,9 +68,11 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="0,1"
 export PYTHONUNBUFFERED=1
 # NCCL 2.28.9 requires CUDA 12.8 libcudart; prepend nvidia/cuda_runtime/lib before torch/lib
-_SP="/home/op/miniconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages"
-export LD_LIBRARY_PATH="${_SP}/nvidia/cuda_runtime/lib:${_SP}/nvidia/nccl/lib:${_SP}/torch/lib:${LD_LIBRARY_PATH:-}"
+_ENV_LIB="/home/op/miniconda3/envs/${CONDA_ENV}/lib"
+_SP="${_ENV_LIB}/python3.11/site-packages"
+export LD_LIBRARY_PATH="${_ENV_LIB}:${_SP}/nvidia/cuda_runtime/lib:${_SP}/nvidia/nccl/lib:${_SP}/torch/lib:${LD_LIBRARY_PATH:-}"
 unset _SP
+unset _ENV_LIB
 HOST="$_BIND_HOST"
 PORT="$_BIND_PORT"
 export MODEL_DIR
