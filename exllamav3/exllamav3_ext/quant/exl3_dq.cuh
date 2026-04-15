@@ -329,8 +329,7 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
     }
     else if constexpr (bits == 3)
     {
-        // B8: Use specialized 3-bit routine with shift reuse instead of generic dq8
-        dq8_aligned_3bits<cb>(ptr, idx, frag0, frag1);
+        dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
     }
     else if constexpr (bits == 4)
     {
@@ -338,8 +337,8 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
     }
     else if constexpr (bits == 5)
     {
-        // B8: Use specialized 5-bit routine with shift reuse instead of generic dq4+dq4
-        dq8_aligned_5bits<cb>(ptr, idx, frag0, frag1);
+        dq4<bits, cb>(ptr, idx, frag0);
+        dq4<bits, cb>(ptr, idx + 4, frag1);
     }
     else if constexpr (bits == 6)
     {

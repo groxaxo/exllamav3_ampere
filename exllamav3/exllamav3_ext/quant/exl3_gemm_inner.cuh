@@ -47,12 +47,12 @@ void exl3_gemm_kernel_inner
     );
 
     // Shared memory
-    __align__(16) extern __shared__ half shared[];
-    half* sh_a = shared;
+    __align__(16) extern __shared__ uint8_t shared_mem[];
+    half* sh_a = (half*) shared_mem;
     uint16_t* sh_b = (uint16_t*) (sh_a + SH_STAGES * sh_a_stage_size);
     size_t sh_c_offset_bytes = (SH_STAGES * sh_a_stage_size * sizeof(half)) + (SH_STAGES * sh_b_stage_size * sizeof(uint16_t));
     sh_c_offset_bytes = (sh_c_offset_bytes + 15) & ~15;
-    float* sh_c = (float*) (((char*)shared) + sh_c_offset_bytes);
+    float* sh_c = (float*) (((char*)shared_mem) + sh_c_offset_bytes);
 
     // Thread index
     int t = threadIdx.x % EXL3_GEMM_BASE_THREADS;
@@ -297,21 +297,11 @@ void exl3_gemm_kernel_inner
         }
 
         // B fragments
-        // B7: Ampere-specific swizzle for B shared memory reads to reduce bank conflicts
         #pragma unroll
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
-            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860)
-            // Apply XOR-based swizzle to avoid bank conflicts on B reads
-            int b_smem_offset = (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits;
-            int b_row = b_smem_offset / (TILEBLOCKS_N * 256 / 16 * bits);
-            int b_col_base = b_smem_offset % (TILEBLOCKS_N * 256 / 16 * bits);
-            int swizzled_offset = b_row * (TILEBLOCKS_N * 256 / 16 * bits) + (b_col_base ^ (b_row & 7));
-            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + swizzled_offset);
-            #else
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
-            #endif
 
             dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }

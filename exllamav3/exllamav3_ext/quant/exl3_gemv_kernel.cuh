@@ -148,8 +148,7 @@ void exl3_gemv_kernel
                 int x = i % (str_B_sh_tile_n / 16);
                 int y = i / (str_B_sh_tile_n / 16);
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860)
-                int swizzled_x = x ^ (y & 7);
-                cp_async_stream(dst + (y * (str_B_sh_tile_n / 16) + swizzled_x), src + y * (str_B_gl_tile_n / 16 * tiles_n) + x);
+                cp_async_stream(dst + i, src + y * (str_B_gl_tile_n / 16 * tiles_n) + x);
                 #else
                 cp_async(dst + i, src + y * (str_B_gl_tile_n / 16 * tiles_n) + x);
                 #endif
@@ -164,14 +163,6 @@ void exl3_gemv_kernel
     auto load_sh2fr_b = [&](int block_n)
     {
         uint32_t* shb = (uint32_t*) B_sh_block;
-        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860)
-        // B1: Shared memory XOR swizzling to reduce bank conflicts
-        size_t b_ptr_offset = (uint8_t*)shb - (uint8_t*)B_sh_tile;
-        size_t b_row = b_ptr_offset / (str_B_sh_tile_n);
-        size_t b_col = b_ptr_offset % (str_B_sh_tile_n);
-        size_t swizzled_offset = b_row * str_B_sh_tile_n + (b_col ^ ((b_row & 7) * 16));
-        shb = (uint32_t*) ((uint8_t*)B_sh_tile + swizzled_offset);
-        #endif
         dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[block_n][0], frag_b[block_n][1]);
     };
 

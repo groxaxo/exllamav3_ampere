@@ -73,9 +73,6 @@ void exl3_gemv
     int split_k = (size_k >= 2 * TILESIZE_K) ? 2 : 1;
     int tilesize_n = 32;
 
-    // split_k > 1 uses atomicAdd, so C must start at zero
-    if (split_k > 1) C.zero_();
-
     int device;
     cudaGetDevice(&device);
     int cc = DevCtx::instance().get_cc(device);
@@ -89,7 +86,7 @@ void exl3_gemv
 
     dim3 threads(32, 1, TILESIZE_K / 16);
 
-    // split_k > 1: each z-block accumulates its partial k-slice via atomicAdd, so C must be zeroed
+    // split_k > 1 uses atomicAdd, so C must start at zero
     if (split_k > 1) C.zero_();
 
     int smem_max = DevCtx::instance().get_smem_max(device);
